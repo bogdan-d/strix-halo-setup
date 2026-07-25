@@ -1,2 +1,6 @@
 *.bak
 *.log
+
+# byte-compiled artefacts from py_compile syntax checks
+__pycache__/
+*.pyc
