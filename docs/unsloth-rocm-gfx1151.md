@@ -104,14 +104,55 @@ guard that enforces four rules:
 
 1. **Stop the GPU consumers first** - image generation, vision models, anything holding
    GTT - and restore them on exit via a trap, so a failed job doesn't leave them down.
-2. **Cap the job.** Run it inside a transient cgroup scope with a hard memory ceiling:
-   `systemd-run --user --scope -p MemoryMax=60G -p MemorySwapMax=2G <cmd>`.
-3. **Add a sentinel.** Poll `MemAvailable` and SIGKILL the job below a floor (we use
-   12 GiB). Killing one job beats losing the desktop.
-4. **Write big artifacts to `<out>.partial` and `mv` on success.** A multi-GB GGUF write
+2. **Cap the job.** Give it a hard memory ceiling:
+   `-p MemoryMax=60G -p MemorySwapMax=2G`.
+3. **Detach it properly** - see the next section. This is the one that bit us.
+4. **Sentinel on the right metrics.** Poll `MemAvailable` and SIGKILL the job below a
+   floor (we use 12 GiB) - but `MemAvailable` alone is not enough. Dirty page cache
+   still counts as *available*, so a box can be completely stalled flushing a multi-GB
+   GGUF while `MemAvailable` looks healthy. Watch `Dirty` + `Writeback` from
+   `/proc/meminfo` as well.
+5. **Write big artifacts to `<out>.partial` and `mv` on success.** A multi-GB GGUF write
    that dies partway otherwise leaves a truncated file sitting at the real filename,
    looking perfectly valid to anything that opens it.
 
-One more on point 4: check free space on the filesystem you are actually writing to.
+One more on point 5: check free space on the filesystem you are actually writing to.
 Model directories are often symlinks to a second drive, so `df $HOME` can report plenty
 of room while the target volume is full.
+
+## Long jobs die the moment you background them
+
+Symptom: the training run dies after ~25 seconds, every time, but only when launched
+as a background task. Memory is nowhere near the cap. No OOM kill, no `systemd-oomd`,
+nothing in the journal but systemd's neutral `Consumed 27.148s CPU time, 7.7G memory
+peak`. Run the identical command in the foreground and it completes.
+
+The cause is `--scope`. A scope is **not** a detached job - systemd only registers the
+cgroup, while the process stays a child of the shell that called `systemd-run`. Kill or
+reap that shell and the whole tree goes with it. Any agent harness, CI runner, or
+terminal multiplexer that cleans up background tasks will take your training run with
+it.
+
+Use a transient **unit** instead, which the user manager forks and owns:
+
+```bash
+# dies with the calling shell
+systemd-run --user --scope -p MemoryMax=60G ./long-job.sh
+
+# survives it
+systemd-run --user --unit=my-train -p MemoryMax=60G ./long-job.sh
+```
+
+Two details worth copying:
+
+- **Skip `--collect`.** It garbage-collects the unit on exit, which throws away the very
+  thing you need: `systemctl --user status my-train` showing the real exit code or
+  signal. Without it you cannot tell a crash from a kill - systemd's `Consumed ...` line
+  is identical for both. Run `systemctl --user reset-failed my-train` before relaunching.
+- **Don't set `Type=oneshot`** without `TimeoutStartSec=infinity`. For oneshot the start
+  timeout covers the entire run, so the default 90 s will kill a long job outright. The
+  default `Type=simple` has no such trap.
+
+Nesting works, so an existing guard script that uses `--scope` internally does not need
+rewriting - just launch the guard itself as a transient unit and the inner scope inherits
+the protection.

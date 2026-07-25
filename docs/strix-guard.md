@@ -66,10 +66,47 @@ box that permits **~50 GB of dirty pages** before the kernel hard-throttles
 writers — at which point every process that touches the filesystem blocks. For a
 desktop that also writes multi-GB GGUFs, byte-based limits are far safer:
 
+**Do not just `sysctl -w` this.** If `tuned` is running it re-applies its profile
+on start and on every profile switch, and silently puts the ratio back. Set it
+through a child profile instead:
+
 ```bash
-# ~4 GB background flush, ~8 GB hard limit, regardless of RAM size
-sudo sysctl -w vm.dirty_background_bytes=4294967296
-sudo sysctl -w vm.dirty_bytes=8589934592
+# tuned >= 2.24 reads user profiles from /etc/tuned/PROFILES/<name>/,
+# not /etc/tuned/<name>/. The old path is ignored with a confusing
+# "Requested profile doesn't exist".
+sudo mkdir -p /etc/tuned/profiles/strix-ai
+sudo tee /etc/tuned/profiles/strix-ai/tuned.conf >/dev/null <<'EOF'
+[main]
+summary=throughput-performance with byte-based dirty limits
+include=throughput-performance
+
+[vm]
+dirty_background_bytes=4294967296   # 4 GiB
+dirty_bytes=8589934592              # 8 GiB
+EOF
+sudo tuned-adm profile strix-ai
+```
+
+Use `dirty_bytes`, not `dirty_ratio`. tuned's vm plugin routes an **absolute**
+value to `vm.dirty_bytes` and zeroes the ratio; a value ending in `%` does the
+reverse. `dirty_ratio` is explicitly deprecated in the plugin because it does not
+support profile inheritance.
+
+**If `tuned-ppd` is active, that is not enough.** It maps power-profiles-daemon
+names onto tuned profiles, so the GNOME power panel — or just a `tuned-ppd`
+restart — reapplies `performance` and reverts you. Repoint it:
+
+```bash
+# /etc/tuned/ppd.conf, [profiles] section
+-performance=throughput-performance
++performance=strix-ai
+```
+
+Verify it actually stuck, including across a restart of both services:
+
+```bash
+sudo systemctl restart tuned tuned-ppd
+sysctl vm.dirty_bytes vm.dirty_ratio   # want 8589934592 and 0
 ```
 
 ## Install
