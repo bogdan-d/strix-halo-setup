@@ -99,8 +99,8 @@ published that claim ourselves and it was wrong.
 ## Unified memory discipline
 
 On Strix Halo the GPU allocates from the same 128 GB as everything else, so a training
-or conversion job competes directly with any resident model server. Two freezes in two
-days taught us the rules:
+or conversion job competes directly with any resident model server. Wrap heavy jobs in a
+guard that enforces four rules:
 
 1. **Stop the GPU consumers first** - image generation, vision models, anything holding
    GTT - and restore them on exit via a trap, so a failed job doesn't leave them down.
@@ -108,10 +108,10 @@ days taught us the rules:
    `systemd-run --user --scope -p MemoryMax=60G -p MemorySwapMax=2G <cmd>`.
 3. **Add a sentinel.** Poll `MemAvailable` and SIGKILL the job below a floor (we use
    12 GiB). Killing one job beats losing the desktop.
-4. **Write big artifacts to `<out>.partial` and `mv` on success.** A 7.9 GB GGUF write
-   that dies at 82% otherwise leaves a truncated file sitting at the real filename,
-   looking valid. Ours did.
+4. **Write big artifacts to `<out>.partial` and `mv` on success.** A multi-GB GGUF write
+   that dies partway otherwise leaves a truncated file sitting at the real filename,
+   looking perfectly valid to anything that opens it.
 
-Point 4 is not theoretical - the write died because the *output* volume filled up while
-the OS volume still showed 135 GiB free. Check the filesystem you are actually writing
-to, not `$HOME`.
+One more on point 4: check free space on the filesystem you are actually writing to.
+Model directories are often symlinks to a second drive, so `df $HOME` can report plenty
+of room while the target volume is full.
