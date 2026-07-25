@@ -1,0 +1,44 @@
+[Unit]
+Description=strix-guard — tailnet kill switch + overload guard
+After=network.target tailscaled.service
+Wants=tailscaled.service
+# Never give up on this one.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/strix-guard
+Restart=always
+RestartSec=3
+
+# --- the "survives an overload" layer --------------------------------------
+# Last thing the kernel OOM killer would ever consider.
+OOMScoreAdjust=-1000
+# Never let systemd-oomd or the cgroup OOM killer take the whole unit down.
+OOMPolicy=continue
+# Memory protected from reclaim even under global pressure.
+MemoryMin=64M
+MemoryLow=128M
+# Stay schedulable when the box is thrashing.
+CPUWeight=800
+IOWeight=800
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+# It needs root: SysRq, SIGKILL of arbitrary pids, systemctl reboot. So harden
+# what is NOT needed rather than dropping privileges.
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=strix-guard
+
+[Install]
+WantedBy=multi-user.target

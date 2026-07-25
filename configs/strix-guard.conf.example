@@ -1,0 +1,60 @@
+# strix-guard configuration — copy to /etc/strix-guard/guard.conf
+#
+# Every host-specific value lives here. Nothing about any particular machine is
+# baked into the daemon.
+
+# --- web ------------------------------------------------------------------
+# The daemon binds ONLY to the machine's Tailscale IPv4 address. It refuses to
+# start if there isn't one, so it is never exposed to the LAN or the internet.
+PORT=7799
+
+# --- overload guard -------------------------------------------------------
+# MiB of MemAvailable below which you get an alert.
+WARN_MIB=12288
+# MiB of MemAvailable below which the biggest unprotected process is killed.
+ACT_MIB=6144
+# How many consecutive low samples before acting (a spike must persist).
+ACT_SAMPLES=4
+SAMPLE_SEC=5
+# Don't kill again within this many seconds.
+KILL_COOLDOWN_SEC=120
+# Never kill anything smaller than this.
+MIN_KILL_MIB=512
+
+# Dirty + writeback MiB above which you get a writeback-pressure alert.
+# This catches the failure mode MemAvailable misses: dirty page cache still
+# counts as "available", so a box can be fully stalled writing back a multi-GB
+# model file while MemAvailable looks perfectly healthy. Set 0 to disable.
+DIRTY_WARN_MIB=16384
+
+# --- what to protect ------------------------------------------------------
+# The daemon already protects the OS itself (systemd, dbus, journald, udev,
+# sshd, tailscaled, NetworkManager, polkitd, and itself).
+#
+# Add YOUR long-running agents/bots here so an overload never takes them out.
+# Comma-separated, matched as case-insensitive substrings of the full cmdline.
+#   PROTECT_EXTRA=my-agent,my-bot/bridge.py,some_cli.main
+PROTECT_EXTRA=
+
+# Extra exact process names (/proc/<pid>/comm) to protect.
+#   PROTECT_NAMES_EXTRA=my-daemon,another-daemon
+PROTECT_NAMES_EXTRA=
+
+# --- what to manage -------------------------------------------------------
+# The user whose `systemctl --user` units the status page reads and restarts.
+# Leave empty to disable unit management entirely.
+#   GUARD_USER=youruser
+GUARD_USER=
+
+# Units shown on the status page and restartable from it. An explicit
+# allowlist: nothing outside this list can ever be restarted through the web
+# UI. Format "unit.service" (defaults to :user) or "unit.service:system".
+#   MANAGED_UNITS=llama-server.service,comfyui.service,some-daemon.service:system
+MANAGED_UNITS=
+
+# --- optional Telegram alerting -------------------------------------------
+# Put the token and chat id in /etc/strix-guard/telegram.env (mode 0600), NOT
+# here:
+#   STRIX_GUARD_TG_TOKEN=...
+#   STRIX_GUARD_TG_CHAT=...
+# Leave that file empty to disable alerts.

@@ -1,0 +1,765 @@
+#!/usr/bin/python3
+"""
+strix-guard — remote kill switch + overload guard for a single-box AI rig.
+
+Why this exists
+---------------
+A box that runs local models can wedge itself: a multi-GB model write or a
+training job fills page cache / GTT, every writer blocks in D state, and the
+desktop stops responding. On many kernels this produces no OOM kill and no
+panic, so nothing recovers you and nothing even logs it. If your only way in is
+SSH to that same box, you are stuck driving to it and holding the power button.
+
+strix-guard gives you two things:
+
+  1. KILL SWITCH — a tiny tailnet-only web page with REBOOT / HARD REBOOT /
+     KILL BIGGEST buttons, usable from a phone. The hard reboot goes through
+     SysRq, so it works when systemd itself can no longer make progress.
+  2. OVERLOAD GUARD — watches MemAvailable and dirty/writeback pressure and
+     kills the largest non-protected process BEFORE the box thrashes itself
+     into a freeze. Services you list as protected are never touched.
+
+Design constraints, deliberate:
+  * python3 stdlib only. No pip, no venv, nothing that can fail to import.
+  * runs as root as a SYSTEM service, so it does not die with a user session.
+  * binds ONLY to the Tailscale address. Never 0.0.0.0.
+  * OOMScoreAdjust=-1000 in the unit, so it is the last thing to be reclaimed.
+  * every destructive action is POST + bearer token + logged.
+
+All host-specific values (user, units, protected processes, thresholds) come
+from /etc/strix-guard/guard.conf. Nothing about any particular machine is
+baked into this file.
+"""
+
+import errno
+import hmac
+import json
+import logging
+import os
+import pwd
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+CONF_DIR = os.environ.get("STRIX_GUARD_CONF_DIR", "/etc/strix-guard")
+CONF_FILE = os.path.join(CONF_DIR, "guard.conf")
+TOKEN_FILE = os.path.join(CONF_DIR, "token")
+TG_ENV = os.path.join(CONF_DIR, "telegram.env")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s strix-guard %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("strix-guard")
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+def _parse_conf(path):
+    conf = {}
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                k, _, v = line.partition("=")
+                conf[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        log.warning("no config at %s — using defaults", path)
+    return conf
+
+
+def _csv(value):
+    return tuple(x.strip() for x in value.split(",") if x.strip())
+
+
+CONF = _parse_conf(CONF_FILE)
+
+PORT = int(CONF.get("PORT", "7799"))
+
+# Memory guard thresholds, in MiB of MemAvailable.
+WARN_MIB = int(CONF.get("WARN_MIB", "12288"))
+ACT_MIB = int(CONF.get("ACT_MIB", "6144"))
+# Dirty+writeback bytes above which we treat the box as writeback-stalled.
+# 0 disables the dirty check.
+DIRTY_WARN_MIB = int(CONF.get("DIRTY_WARN_MIB", "16384"))
+# MemAvailable must stay low for this many consecutive samples before we act,
+# so a brief allocation spike is not enough to kill anything.
+ACT_SAMPLES = int(CONF.get("ACT_SAMPLES", "4"))
+SAMPLE_SEC = int(CONF.get("SAMPLE_SEC", "5"))
+KILL_COOLDOWN_SEC = int(CONF.get("KILL_COOLDOWN_SEC", "120"))
+# Nothing smaller than this is ever considered worth killing.
+MIN_KILL_MIB = int(CONF.get("MIN_KILL_MIB", "512"))
+
+# The user whose `systemctl --user` units are managed. Empty = disable that.
+GUARD_USER = CONF.get("GUARD_USER", "")
+# Units the web UI may restart, "name.service:user" or "name.service:system".
+MANAGED_UNITS = []
+for spec in _csv(CONF.get("MANAGED_UNITS", "")):
+    unit, _, scope = spec.partition(":")
+    MANAGED_UNITS.append((unit, scope or "user"))
+
+# Processes that must survive an overload. OS-level defaults only; add your own
+# via PROTECT_EXTRA in guard.conf.
+PROTECT_NAMES = {
+    "systemd", "systemd-journald", "systemd-logind", "systemd-udevd",
+    "systemd-oomd", "dbus-broker", "dbus-daemon", "init", "kthreadd",
+    "kworker", "tailscaled", "sshd", "polkitd", "NetworkManager",
+    "strix-guard",
+}
+PROTECT_NAMES.update(_csv(CONF.get("PROTECT_NAMES_EXTRA", "")))
+
+PROTECT_CMD_SUBSTRINGS = tuple(
+    s.lower() for s in (
+        ("/usr/lib/systemd", "tailscaled", "strix-guard")
+        + _csv(CONF.get("PROTECT_EXTRA", ""))
+    )
+)
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def read_token():
+    try:
+        with open(TOKEN_FILE) as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        log.error("cannot read %s: %s", TOKEN_FILE, exc)
+        return None
+
+
+def load_tg():
+    """Optional Telegram alerting. Absent config just disables alerts."""
+    tok = chat = None
+    try:
+        with open(TG_ENV) as fh:
+            for line in fh:
+                m = re.match(r"\s*(?:export\s+)?(\w+)\s*=\s*[\"']?([^\"'\s]+)", line)
+                if not m:
+                    continue
+                if m.group(1) == "STRIX_GUARD_TG_TOKEN":
+                    tok = m.group(2)
+                elif m.group(1) == "STRIX_GUARD_TG_CHAT":
+                    chat = m.group(2)
+    except OSError:
+        pass
+    return tok, chat
+
+
+def tg_alert(text):
+    tok, chat = load_tg()
+    if not tok or not chat:
+        return
+    try:
+        data = urllib.parse.urlencode({
+            "chat_id": chat, "text": text,
+            "disable_web_page_preview": "true",
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{tok}/sendMessage", data=data)
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as exc:  # noqa: BLE001 - alerting must never crash the guard
+        log.warning("telegram alert failed: %s", exc)
+
+
+def meminfo():
+    out = {}
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, _, rest = line.partition(":")
+                out[k] = int(rest.strip().split()[0]) // 1024  # MiB
+    except OSError:
+        pass
+    return out
+
+
+def uptime_str():
+    try:
+        with open("/proc/uptime") as fh:
+            secs = int(float(fh.read().split()[0]))
+        d, rem = divmod(secs, 86400)
+        h, rem = divmod(rem, 3600)
+        return f"{d}d {h}h {rem // 60}m" if d else f"{h}h {rem // 60}m"
+    except OSError:
+        return "?"
+
+
+def loadavg():
+    try:
+        with open("/proc/loadavg") as fh:
+            return " ".join(fh.read().split()[:3])
+    except OSError:
+        return "?"
+
+
+def gtt_used_mib():
+    """iGPU GTT usage. On an APU this can pin most of system RAM."""
+    try:
+        import glob
+        for p in glob.glob("/sys/class/drm/card*/device/mem_info_gtt_used"):
+            with open(p) as fh:
+                return int(fh.read().strip()) // (1024 * 1024)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def proc_table():
+    """(pid, rss_mib, comm, cmdline) for every readable process, RSS desc."""
+    rows = []
+    page = os.sysconf("SC_PAGE_SIZE")
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/statm") as fh:
+                rss = int(fh.read().split()[1]) * page // (1024 * 1024)
+            with open(f"/proc/{pid}/comm") as fh:
+                comm = fh.read().strip()
+            with open(f"/proc/{pid}/cmdline") as fh:
+                cmd = fh.read().replace("\0", " ").strip() or comm
+        except (OSError, ValueError, IndexError):
+            continue
+        rows.append((int(pid), rss, comm, cmd))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    return rows
+
+
+def is_protected(pid, comm, cmd):
+    if pid == os.getpid() or pid == 1:
+        return True
+    if comm in PROTECT_NAMES:
+        return True
+    low = cmd.lower()
+    return any(s in low for s in PROTECT_CMD_SUBSTRINGS)
+
+
+def kill_hogs(count=1, dry_run=False):
+    """SIGKILL the largest non-protected processes. Returns list of dicts."""
+    killed = []
+    for pid, rss, comm, cmd in proc_table():
+        if len(killed) >= count:
+            break
+        if rss < MIN_KILL_MIB:
+            break
+        if is_protected(pid, comm, cmd):
+            continue
+        entry = {"pid": pid, "rss_mib": rss, "comm": comm, "cmd": cmd[:200]}
+        if dry_run:
+            killed.append(entry)
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            log.warning("KILLED pid=%s rss=%sMiB comm=%s", pid, rss, comm)
+            killed.append(entry)
+        except OSError as exc:
+            if exc.errno != errno.ESRCH:
+                log.warning("kill %s failed: %s", pid, exc)
+    return killed
+
+
+def sysrq(ch):
+    with open("/proc/sysrq-trigger", "w") as fh:
+        fh.write(ch)
+
+
+def do_hard_reboot():
+    """Emergency reboot that does not need a working userspace.
+
+    sync -> remount read-only -> immediate reboot. This is the path that works
+    when `systemctl reboot` hangs because systemd cannot make progress.
+
+    Requires kernel.sysrq to permit reboot (bit 128, or just 1 for all). If
+    SysRq is restricted this silently does nothing, so we fall back to
+    `reboot -f`.
+    """
+    log.critical("HARD REBOOT requested — sysrq s,u,b")
+    tg_alert("strix-guard: HARD REBOOT (sysrq) triggered")
+    time.sleep(1)
+    for ch in ("s", "u"):
+        try:
+            sysrq(ch)
+            time.sleep(2)
+        except OSError as exc:
+            log.error("sysrq %s failed: %s", ch, exc)
+    try:
+        sysrq("b")
+    except OSError as exc:
+        log.error("sysrq b failed: %s — falling back to reboot -f", exc)
+        subprocess.Popen(["/usr/sbin/reboot", "-f"])
+
+
+def do_graceful_reboot():
+    log.critical("graceful reboot requested")
+    tg_alert("strix-guard: graceful reboot requested")
+    subprocess.Popen(["/usr/bin/systemctl", "reboot"])
+
+
+# --------------------------------------------------------------------------
+# talking to the desktop user's systemd
+# --------------------------------------------------------------------------
+
+_UID_CACHE = {}
+
+
+def _guard_uid():
+    if "v" not in _UID_CACHE:
+        try:
+            ent = pwd.getpwnam(GUARD_USER)
+            _UID_CACHE["v"] = (ent.pw_uid, ent.pw_gid, ent.pw_dir)
+        except KeyError:
+            _UID_CACHE["v"] = (None, None, None)
+    return _UID_CACHE["v"]
+
+
+VALID_STATES = {"active", "inactive", "failed", "activating", "deactivating",
+                "reloading", "maintenance"}
+
+
+def user_systemctl(args, timeout=30):
+    """Run `systemctl --user ...` against GUARD_USER's manager, from root.
+
+    Deliberately NOT `-M user@.host`: that route goes through systemd-machined
+    and spawns a transient unit, which fails from inside a hardened service
+    ("Failed to start transient service unit: Connection reset by peer").
+    Dropping to the target uid and pointing at their runtime dir + session bus
+    is a plain fork+exec with no extra moving parts.
+
+    Returns (CompletedProcess, None) or (None, error). Callers must treat an
+    error as "unknown" and never surface it to the UI.
+    """
+    if not GUARD_USER:
+        return None, "GUARD_USER not configured"
+    uid, gid, home = _guard_uid()
+    if uid is None:
+        return None, f"unknown user {GUARD_USER}"
+    runtime = f"/run/user/{uid}"
+    if not os.path.isdir(runtime):
+        return None, f"{runtime} missing (user not logged in / no lingering)"
+    env = {
+        "XDG_RUNTIME_DIR": runtime,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
+        "PATH": "/usr/bin:/bin",
+        "HOME": home or "/",
+    }
+    try:
+        return subprocess.run(
+            ["/usr/bin/systemctl", "--user"] + args,
+            capture_output=True, text=True, timeout=timeout, env=env,
+            user=uid, group=gid, extra_groups=[]), None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"[:200]
+
+
+def restart_unit(unit):
+    scope = None
+    for name, sc in MANAGED_UNITS:
+        if name == unit:
+            scope = sc
+            break
+    if scope is None:
+        return False, "unit not in allowlist"
+    if scope == "user":
+        p, err = user_systemctl(["restart", unit], timeout=60)
+        if err:
+            log.warning("restart %s failed: %s", unit, err)
+            return False, err
+    else:
+        try:
+            p = subprocess.run(["/usr/bin/systemctl", "restart", unit],
+                               capture_output=True, text=True, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)[:200]
+    ok = p.returncode == 0
+    detail = (p.stderr or p.stdout or "").strip()[:300]
+    log.info("restart %s -> rc=%s %s", unit, p.returncode, detail)
+    return ok, detail or ("ok" if ok else f"rc={p.returncode}")
+
+
+def unit_states():
+    """State of each managed unit. Never leaks a transport error into the UI."""
+    out = []
+    for name, scope in MANAGED_UNITS:
+        if scope == "user":
+            p, err = user_systemctl(["is-active", name], timeout=10)
+        else:
+            err = None
+            try:
+                p = subprocess.run(["/usr/bin/systemctl", "is-active", name],
+                                   capture_output=True, text=True, timeout=10)
+            except Exception as exc:  # noqa: BLE001
+                p, err = None, str(exc)[:120]
+        if err or p is None:
+            log.warning("unit state query failed for %s: %s", name, err)
+            state = "unknown"
+        else:
+            raw = (p.stdout or "").strip()   # non-zero rc is normal for inactive
+            if raw in VALID_STATES:
+                state = raw
+            else:
+                log.warning("unit state for %s returned %r / %r", name, raw,
+                            (p.stderr or "").strip()[:160])
+                state = "unknown"
+        out.append({"unit": name, "state": state})
+    return out
+
+
+def snapshot():
+    mi = meminfo()
+    total, avail = mi.get("MemTotal", 0), mi.get("MemAvailable", 0)
+    return {
+        "host": socket.gethostname(),
+        "uptime": uptime_str(),
+        "load": loadavg(),
+        "mem_total_mib": total,
+        "mem_avail_mib": avail,
+        "mem_used_pct": round(100 * (total - avail) / total, 1) if total else 0,
+        "swap_total_mib": mi.get("SwapTotal", 0),
+        "swap_free_mib": mi.get("SwapFree", 0),
+        "dirty_mib": mi.get("Dirty", 0),
+        "writeback_mib": mi.get("Writeback", 0),
+        "gtt_used_mib": gtt_used_mib(),
+        "warn_mib": WARN_MIB,
+        "act_mib": ACT_MIB,
+        "top": [{"pid": p, "rss_mib": r, "comm": c,
+                 "protected": is_protected(p, c, cmd)}
+                for p, r, c, cmd in proc_table()[:12]],
+        "units": unit_states(),
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+    }
+
+
+# --------------------------------------------------------------------------
+# overload guard
+# --------------------------------------------------------------------------
+
+class MemoryGuard(threading.Thread):
+    daemon = True
+
+    def __init__(self):
+        super().__init__(name="memguard")
+        self.low_streak = 0
+        self.last_kill = 0.0
+        self.warned = False
+        self.dirty_warned = False
+
+    def run(self):
+        log.info("overload guard: warn<%sMiB act<%sMiB x%s samples @%ss "
+                 "dirty_warn=%sMiB", WARN_MIB, ACT_MIB, ACT_SAMPLES,
+                 SAMPLE_SEC, DIRTY_WARN_MIB)
+        while True:
+            try:
+                self.tick()
+            except Exception as exc:  # noqa: BLE001 - never let the guard die
+                log.error("memguard tick failed: %s", exc)
+            time.sleep(SAMPLE_SEC)
+
+    def tick(self):
+        mi = meminfo()
+        avail = mi.get("MemAvailable", 0)
+        if avail == 0:
+            return
+
+        # Writeback pressure. This is the failure mode MemAvailable misses:
+        # dirty page cache still counts as "available", so a box can be fully
+        # stalled on writeback while MemAvailable looks perfectly healthy.
+        dirty = mi.get("Dirty", 0) + mi.get("Writeback", 0)
+        if DIRTY_WARN_MIB and dirty > DIRTY_WARN_MIB:
+            if not self.dirty_warned:
+                self.dirty_warned = True
+                msg = (f"strix-guard: writeback pressure — {dirty} MiB dirty. "
+                       f"Large writes can stall every process on this box.")
+                log.warning(msg)
+                tg_alert(msg)
+        elif dirty < DIRTY_WARN_MIB // 2:
+            self.dirty_warned = False
+
+        if avail < WARN_MIB and not self.warned:
+            self.warned = True
+            lines = "\n".join(
+                f"  {r}MiB {c} (pid {p})"
+                f"{'  [protected]' if is_protected(p, c, cmd) else ''}"
+                for p, r, c, cmd in proc_table()[:3])
+            tg_alert(f"strix-guard: memory low — {avail} MiB available\n"
+                     f"top:\n{lines}")
+            log.warning("memory low: %s MiB available", avail)
+        elif avail > WARN_MIB * 1.25:
+            self.warned = False
+
+        if avail < ACT_MIB:
+            self.low_streak += 1
+        else:
+            self.low_streak = 0
+            return
+
+        if self.low_streak < ACT_SAMPLES:
+            return
+        if time.time() - self.last_kill < KILL_COOLDOWN_SEC:
+            return
+
+        killed = kill_hogs(count=1)
+        self.last_kill = time.time()
+        self.low_streak = 0
+        if killed:
+            k = killed[0]
+            msg = (f"strix-guard: OVERLOAD — killed {k['comm']} "
+                   f"(pid {k['pid']}, {k['rss_mib']} MiB) to keep the box "
+                   f"alive. MemAvailable was {avail} MiB.")
+        else:
+            msg = (f"strix-guard: memory critical ({avail} MiB) but nothing "
+                   f"killable — every large process is protected.")
+        log.critical(msg)
+        tg_alert(msg)
+
+
+# --------------------------------------------------------------------------
+# http
+# --------------------------------------------------------------------------
+
+PAGE = """<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>strix-guard</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;padding:18px;background:#0d1117;color:#e6edf3;
+ font:15px/1.5 ui-sans-serif,-apple-system,system-ui,sans-serif}
+h1{font-size:17px;margin:0 0 4px;letter-spacing:.3px}
+.sub{color:#8b949e;font-size:13px;margin-bottom:18px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;
+ padding:14px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:10px}
+.stat{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:10px}
+.stat b{display:block;font-size:20px;font-variant-numeric:tabular-nums}
+.stat span{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.6px}
+button{width:100%;padding:15px;border:0;border-radius:9px;font-size:16px;
+ font-weight:600;color:#fff;margin-bottom:10px;cursor:pointer;
+ -webkit-tap-highlight-color:transparent}
+button:active{transform:scale(.985)}
+.amber{background:#9e6a03}.red{background:#b62324}.grey{background:#30363d}
+table{width:100%;border-collapse:collapse;font-size:13px;
+ font-variant-numeric:tabular-nums}
+td{padding:4px 0;border-bottom:1px solid #21262d}
+td:last-child{text-align:right;color:#8b949e}
+.prot{color:#3fb950}
+#out{white-space:pre-wrap;font:12px ui-monospace,monospace;color:#8b949e;
+ margin-top:6px}
+.bar{height:7px;background:#21262d;border-radius:4px;overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%;background:#3fb950}
+</style>
+<h1>strix-guard</h1>
+<div class=sub id=sub>loading&hellip;</div>
+
+<div class=card>
+  <div class=grid id=stats></div>
+  <div class=bar><i id=membar style="width:0"></i></div>
+</div>
+
+<div class=card>
+  <button class=grey onclick="act('killhogs')">Kill biggest process</button>
+  <button class=amber onclick="act('reboot')">Graceful reboot</button>
+  <button class=red onclick="act('hardreboot')">HARD reboot (SysRq)</button>
+  <div id=out></div>
+</div>
+
+<div class=card><table id=units></table></div>
+<div class=card><table id=top></table></div>
+
+<script>
+const T = new URLSearchParams(location.search).get('t') || '';
+const H = {'Authorization':'Bearer '+T};
+let armed = null;
+
+async function refresh(){
+  try{
+    const r = await fetch('/api/status',{headers:H});
+    if(!r.ok){document.getElementById('sub').textContent =
+      r.status===401?'bad or missing token — append ?t=YOURTOKEN':'error '+r.status; return;}
+    const d = await r.json();
+    document.getElementById('sub').textContent =
+      d.host+' · up '+d.uptime+' · load '+d.load+' · '+d.ts;
+    document.getElementById('stats').innerHTML = [
+      ['Avail RAM', (d.mem_avail_mib/1024).toFixed(1)+' G'],
+      ['Used', d.mem_used_pct+'%'],
+      ['Dirty', (d.dirty_mib/1024).toFixed(1)+' G'],
+      ['GTT', (d.gtt_used_mib/1024).toFixed(1)+' G'],
+    ].map(([k,v])=>`<div class=stat><b>${v}</b><span>${k}</span></div>`).join('');
+    const bar = document.getElementById('membar');
+    bar.style.width = d.mem_used_pct+'%';
+    bar.style.background = d.mem_used_pct>92?'#f85149':d.mem_used_pct>80?'#d29922':'#3fb950';
+    document.getElementById('units').innerHTML = d.units.map(u=>
+      `<tr><td>${u.unit.replace('.service','')}</td><td style="color:${
+        u.state==='active'?'#3fb950':u.state==='unknown'?'#8b949e':'#f85149'
+      }">${u.state}</td></tr>`).join('');
+    document.getElementById('top').innerHTML = d.top.map(p=>
+      `<tr><td>${p.comm}${p.protected?' <span class=prot>&#9679;</span>':''}</td>`+
+      `<td>${p.rss_mib} MiB</td></tr>`).join('');
+  }catch(e){ document.getElementById('sub').textContent = 'unreachable: '+e; }
+}
+
+async function act(what){
+  const out = document.getElementById('out');
+  if(armed !== what){
+    armed = what;
+    out.textContent = 'tap the same button again within 5s to confirm "'+what+'"';
+    setTimeout(()=>{ if(armed===what){armed=null; out.textContent='(confirmation expired)';} }, 5000);
+    return;
+  }
+  armed = null;
+  out.textContent = 'sending '+what+'\\u2026';
+  try{
+    const r = await fetch('/api/'+what,{method:'POST',headers:H});
+    out.textContent = await r.text();
+  }catch(e){ out.textContent = 'sent (connection dropped — expected on reboot)'; }
+}
+
+refresh(); setInterval(refresh, 5000);
+</script>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "strix-guard"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        log.info("%s %s", self.client_address[0], fmt % args)
+
+    def _authed(self):
+        want = read_token()
+        if not want:
+            return False
+        got = ""
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            got = auth[7:].strip()
+        if not got:
+            q = urllib.parse.urlparse(self.path).query
+            got = urllib.parse.parse_qs(q).get("t", [""])[0]
+        return hmac.compare_digest(got, want)
+
+    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/healthz":                       # unauthenticated liveness
+            return self._send(200, "ok\n")
+        if path == "/":
+            return self._send(200, PAGE, "text/html; charset=utf-8")
+        if not self._authed():
+            return self._send(401, "unauthorized\n")
+        if path == "/api/status":
+            return self._send(200, json.dumps(snapshot()), "application/json")
+        return self._send(404, "not found\n")
+
+    def do_POST(self):
+        if not self._authed():
+            return self._send(401, "unauthorized\n")
+        path = urllib.parse.urlparse(self.path).path
+        peer = self.client_address[0]
+
+        if path == "/api/killhogs":
+            killed = kill_hogs(count=1)
+            if not killed:
+                return self._send(200, "nothing killable "
+                                       "(everything large is protected)\n")
+            k = killed[0]
+            tg_alert(f"strix-guard: manual kill of {k['comm']} "
+                     f"(pid {k['pid']}, {k['rss_mib']} MiB) from {peer}")
+            return self._send(200, f"killed {k['comm']} pid={k['pid']} "
+                                   f"rss={k['rss_mib']}MiB\n")
+
+        if path == "/api/reboot":
+            log.critical("reboot requested by %s", peer)
+            threading.Timer(0.5, do_graceful_reboot).start()
+            return self._send(200, "graceful reboot queued — if the box is "
+                                   "still up in 60s, use HARD reboot\n")
+
+        if path == "/api/hardreboot":
+            log.critical("HARD reboot requested by %s", peer)
+            threading.Timer(0.5, do_hard_reboot).start()
+            return self._send(200, "hard reboot (sysrq s,u,b) queued\n")
+
+        if path.startswith("/api/restart/"):
+            unit = urllib.parse.unquote(path[len("/api/restart/"):])
+            ok, detail = restart_unit(unit)
+            return self._send(200 if ok else 400,
+                              f"{'ok' if ok else 'failed'}: {unit} {detail}\n")
+
+        return self._send(404, "not found\n")
+
+
+# --------------------------------------------------------------------------
+# bind
+# --------------------------------------------------------------------------
+
+def tailscale_ip(timeout=180):
+    """Wait for the tailnet address. We bind ONLY here — never 0.0.0.0."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            p = subprocess.run(["tailscale", "ip", "-4"],
+                               capture_output=True, text=True, timeout=10)
+            ips = (p.stdout or "").strip().splitlines()
+            if ips and ips[0].startswith("100."):
+                return ips[0]
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(3)
+    return None
+
+
+def main():
+    if os.geteuid() != 0:
+        log.error("must run as root (needs sysrq, kill, systemctl reboot)")
+        return 1
+    if not read_token():
+        log.error("no token at %s — run install.sh", TOKEN_FILE)
+        return 1
+
+    ip = tailscale_ip()
+    if not ip:
+        log.error("no tailscale IPv4 after 180s; refusing to bind 0.0.0.0")
+        return 1
+
+    MemoryGuard().start()
+    httpd = ThreadingHTTPServer((ip, PORT), Handler)
+    httpd.daemon_threads = True
+    log.info("listening on http://%s:%s (tailnet only)", ip, PORT)
+    tg_alert(f"strix-guard up on http://{ip}:{PORT} — uptime {uptime_str()}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
