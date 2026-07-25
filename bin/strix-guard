@@ -638,7 +638,11 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        log.info("%s %s", self.client_address[0], fmt % args)
+        # The bookmark URL carries the token as ?t=..., and the default
+        # BaseHTTPRequestHandler log line includes the full request line. Never
+        # write the token to the journal — journals get shipped to backups.
+        msg = re.sub(r"([?&]t=)[^\s&\"']+", r"\1<redacted>", fmt % args)
+        log.info("%s %s", self.client_address[0], msg)
 
     def _authed(self):
         want = read_token()
