@@ -53,6 +53,7 @@ All GPU services run as **systemd user services** with auto-start on boot.
 | XRT | 2.23.0 | NPU runtime, built from `~/xdna-driver` |
 | amdxdna | 2.23.0 (DKMS) | NPU kernel module |
 | FastFlowLM | v0.9.36 | NPU inference server |
+| Unsloth | 2026.7.4 (torch 2.11.0+rocm7.13.0) | Fine-tuning, isolated venv at `~/.unsloth/studio`. See [`docs/unsloth-rocm-gfx1151.md`](docs/unsloth-rocm-gfx1151.md) |
 
 ## Quick start
 
@@ -497,7 +498,8 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 │   └── claude-code-router.config.json    # ccr config → local :8001 (secrets redacted)
 ├── docs/
 │   ├── claude-code-local-qwen3.6-mtp.md  # Claude Code on local Qwen3.6 (full writeup)
-│   └── comfyui-qwen-image.md             # Qwen-Image GGUF workflow notes
+│   ├── comfyui-qwen-image.md             # Qwen-Image GGUF workflow notes
+│   └── unsloth-rocm-gfx1151.md           # Fine-tuning: Unsloth on ROCm, multimodal LoRA, GGUF
 ├── tools/
 │   └── cc-qwen-vs-opus.sh                # Head-to-head test harness (local Qwen3.6 vs Opus)
 ├── workflows/
