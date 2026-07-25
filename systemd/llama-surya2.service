@@ -6,8 +6,8 @@ After=default.target
 Type=simple
 ExecStart=/usr/bin/toolbox run -c llama-rocm-7.2.4 \
   llama-server \
-    -m /home/awpapa/models/surya-2/surya-2.gguf \
-    --mmproj /home/awpapa/models/surya-2/surya-2-mmproj.gguf \
+    -m %h/models/surya-2/surya-2.gguf \
+    --mmproj %h/models/surya-2/surya-2-mmproj.gguf \
     -ngl 99 \
     --no-mmap \
     --flash-attn on \

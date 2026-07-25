@@ -19,9 +19,9 @@ Wants=network-online.target
 Type=simple
 Environment=GGML_VK_PREFER_HOST_MEMORY=ON
 Environment=RADV_PERFTEST=nogttspill
-ExecStart=/home/awpapa/llama.cpp/build/bin/llama-server \
-  -m /home/awpapa/models/gemma-4-q4/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
-  -md /home/awpapa/models/gemma-4-q4/mtp-gemma-4-26B-A4B-it.gguf \
+ExecStart=%h/llama.cpp/build/bin/llama-server \
+  -m %h/models/gemma-4-q4/gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf \
+  -md %h/models/gemma-4-q4/mtp-gemma-4-26B-A4B-it.gguf \
   --spec-type draft-mtp \
   --spec-draft-n-max 3 \
   -ngld 99 \

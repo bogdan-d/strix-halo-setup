@@ -15,8 +15,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=GGML_VK_PREFER_HOST_MEMORY=ON
-ExecStart=/home/awpapa/llama.cpp/build/bin/llama-server \
-  -m /home/awpapa/models/qwen3.6-27b-mtp/Qwen3.6-27B-UD-Q4_K_XL.gguf \
+ExecStart=%h/llama.cpp/build/bin/llama-server \
+  -m %h/models/qwen3.6-27b-mtp/Qwen3.6-27B-UD-Q4_K_XL.gguf \
   --spec-type draft-mtp \
   --spec-draft-n-max 5 \
   --ctx-size 262144 \

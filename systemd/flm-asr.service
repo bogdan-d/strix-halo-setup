@@ -3,8 +3,8 @@ Description=FastFlowLM ASR+LLM on AMD NPU (whisper STT for Jarvis) :52625
 After=network.target
 
 [Service]
-Environment=HOME=/home/awpapa
-WorkingDirectory=/home/awpapa
+Environment=HOME=%h
+WorkingDirectory=%h
 ExecStart=/bin/bash -c 'source /opt/xilinx/xrt/setup.sh >/dev/null 2>&1; export PATH="/opt/fastflowlm/bin:$PATH"; exec flm serve lfm2:2.6b --asr 1'
 Restart=on-failure
 RestartSec=5
