@@ -92,9 +92,9 @@ python convert_hf_to_gguf.py <merged-dir> --outfile model-Q8_0.gguf.partial --ou
 ```
 
 Its converter registers `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`,
-`Gemma4AssistantForCausalLM` and `Gemma4UnifiedForConditionalGeneration`. If you read
-somewhere that llama.cpp lacks `gemma4` support, check again before believing it - we
-published that claim ourselves and it was wrong.
+`Gemma4AssistantForCausalLM` and `Gemma4UnifiedForConditionalGeneration`, so claims that
+llama.cpp lacks `gemma4` support are out of date. Check the converter's registry rather
+than the changelog.
 
 ## Unified memory discipline
 
