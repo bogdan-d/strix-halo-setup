@@ -124,8 +124,47 @@ until `startGame()` runs, the contract probe throws, and the gate stops before t
 anything.
 
 That is **spec-compliance as ritual**: pattern-matching the shape of a requirement
-while missing its purpose. For comparison, a 27B/35B model of the same generation
-distilled for reasoning clears this gate.
+while missing its purpose.
+
+### The quant experiment: does better preservation fix it?
+
+Worth testing, because the failure above is a *comprehension* failure and comprehension
+lives in attention. A second quant of the same model — same 2-bit routed experts, but
+attention projections, shared experts and output kept at **Q8** — was run against the
+identical spec and judge.
+
+It behaved measurably differently:
+
+| build | testability contract | checks passed |
+|---|---|---|
+| uniform 2-bit (IQ2_XXS) | **failed** — declared the names, stubbed the bodies | 0 of 14 reached |
+| Q8 attention / shared / output | **passed** | 4 of 14 |
+
+So better preservation of those layers *did* buy comprehension: the second build
+understood what the contract was for, where the first only matched its shape. It did
+not buy the ability to build a working game — the remaining ten failures cluster
+entirely in the movement layer (nothing eats a dot, three of four ghosts never leave
+the house), which the 2-bit routed experts evidently cannot hold together.
+
+A useful corollary: **the thinking budget can eat the whole job.** At
+`--reasoning-budget 4096` this model spent 48 minutes redesigning the maze in its
+reasoning ("actually, let me make it simpler" — repeatedly) and truncated mid-file.
+Cutting it to 2048 produced a complete 24KB file that reached every gate check. On a
+thinking model, an over-generous reasoning cap is not a safety margin, it is a failure
+mode.
+
+### Scoreboard
+
+Same specification, same automated judge, verified-identical prompt:
+
+| model | result | time |
+|---|---|---|
+| DeepSeek-V4-284B, uniform 2-bit | 0 of 14 checks reached | 44 min |
+| DeepSeek-V4-284B, Q8-attention quant | 4 of 14 | 55 min |
+| Qwen3.6-27B, reasoning-distilled | 6 of 14 | 10 min |
+| Qwen3.6-35B-A3B, reasoning-distilled | **working game, first try** | 77 sec |
+
+The 35B is roughly **43× faster and correct**. That is the practical verdict.
 
 It does write large coherent programs: a complete self-contained Pac-Man (canvas, four
 ghosts, collision, score, game loop, balanced braces, closing `</html>`) in ~12 minutes
