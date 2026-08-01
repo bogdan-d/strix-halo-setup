@@ -67,6 +67,20 @@ systemctl --user start llama-server comfyui
 
 For NPU setup, see [NPU Setup](#npu-setup) below.
 
+## DeepSeek V4 Flash (284B) — frontier-scale, fully local
+
+A **284B-parameter model at full 131k context** on this box, GPU-offloaded via Vulkan,
+no CUDA. 130 t/s prompt, 12 t/s generation, ~5% decay to 4k depth. Measured 2026-08-01.
+Includes the traps that cost a day (the `llama-cli` interactive-EOF loop that mimics a
+hung model, Vulkan's ~5GB single-allocation cap, reasoning-budget starvation, the
+q8_0-KV throughput penalty) and an honest quality verdict against a strict spec
+benchmark. Full writeup: [`docs/deepseek-v4-flash-284b.md`](docs/deepseek-v4-flash-284b.md).
+
+```bash
+llama-server -m DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf \
+  -ngl 99 -c 131072 -ub 1024 -fa on -np 1 --cache-prompt --reasoning-budget 4096
+```
+
 ## Claude Code on local Qwen3.6 (offline, 256k, MTP)
 
 Run the **Claude Code CLI against the local Qwen3.6-35B-A3B** model — fully offline,
