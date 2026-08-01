@@ -1,0 +1,410 @@
+From db8a8cf0385a66e3d1378340da513efc1fde37f9 Mon Sep 17 00:00:00 2001
+From: Zach Aw <zachary_aw@outlook.sg>
+Date: Sat, 1 Aug 2026 08:19:05 +0800
+Subject: [PATCH 2/5] vulkan: add GGML_OP_DSV4_ROPE_TAIL kernel
+
+Partial ("tail") RoPE for DeepSeek-V4: the first ne0 - n_dims elements of
+each row pass through unchanged; the last n_dims are rotary-embedded like a
+normal/neox RoPE over an n_dims head. Reuses the shared rope push-constants
+and rope_yarn(), so the math tracks the mainline RoPE shaders (and the CPU
+reference within tolerance). The `inverse` op flag maps to is_back, which
+negates sin while leaving cos unchanged - the same effect as the CPU
+sin_sign = -1 path.
+
+One thread per output element (wg_denoms.y == local_size_y == 256); n_nope
+may be odd, so the copy region is handled element-wise and each rotated pair
+is written by the thread that owns its first element. F32 and F16 variants;
+supports_op mirrors the Metal gate (extended to F16 like the CPU op) plus a
+contiguous-rows guard.
+
+Wired through the generic vk_op_f32 path alongside GGML_OP_ROPE (shared
+elements/dispatch branches), with a dsv4-specific push-constant builder for
+the differing op_params layout, plus test-backend-ops coverage: f32/f16,
+normal/neox, inverse 0/1, freq_factors, non-contiguous view, YaRN, batch,
+odd n_nope, n_dims variants, and a 4096-row split. 27/27 pass on RADV
+GFX1151.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  84 +++++++++++++-
+ .../vulkan-shaders/dsv4_rope_tail.comp        |  83 ++++++++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   3 +
+ tests/test-backend-ops.cpp                    | 103 ++++++++++++++++++
+ 4 files changed, 272 insertions(+), 1 deletion(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/dsv4_rope_tail.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index deb3092..563a637 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -816,6 +816,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
+     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
+     vk_pipeline pipeline_rope_vision_f32, pipeline_rope_vision_f16;
++    vk_pipeline pipeline_dsv4_rope_tail_f32, pipeline_dsv4_rope_tail_f16;
+     vk_pipeline pipeline_argsort_f32[num_argsort_pipelines];
+     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
+     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
+@@ -4625,6 +4626,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
+     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32_f16, "rope_neox_f32_f16", rope_neox_f32_f16_len, rope_neox_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_rope_multi_f32_f16, "rope_multi_f32_f16", rope_multi_f32_f16_len, rope_multi_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+ 
++    // dsv4_rope_tail: one thread per output element (wg_denoms.y == local_size_y == 256)
++    ggml_vk_create_pipeline(device, device->pipeline_dsv4_rope_tail_f32, "dsv4_rope_tail_f32", dsv4_rope_tail_f32_len, dsv4_rope_tail_f32_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 256, 1}, {}, 1);
++    ggml_vk_create_pipeline(device, device->pipeline_dsv4_rope_tail_f16, "dsv4_rope_tail_f16", dsv4_rope_tail_f16_len, dsv4_rope_tail_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 256, 1}, {}, 1);
++
+     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
+         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
+         if (i <= device->max_workgroup_size_log2 &&
+@@ -9647,6 +9652,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const
+             return ctx->device->pipeline_dsv4_fp8_kv_quantize_f32;
+         }
+         return nullptr;
++    case GGML_OP_DSV4_ROPE_TAIL:
++        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
++            return ctx->device->pipeline_dsv4_rope_tail_f32;
++        }
++        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
++            return ctx->device->pipeline_dsv4_rope_tail_f16;
++        }
++        return nullptr;
+     case GGML_OP_CUMSUM:
+         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+             if (src0->ne[0] <= 512) {
+@@ -10046,6 +10059,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         break;
+     case GGML_OP_ROPE:
+     case GGML_OP_ROPE_BACK:
++    case GGML_OP_DSV4_ROPE_TAIL:
+         {
+             uint32_t nrows = (uint32_t)ggml_nrows(src0);
+             uint32_t z = 1;
+@@ -10256,7 +10270,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
+         vk_subbuffer subbuf1 = use_src1 ? src1_buf : src0_buf;
+         vk_subbuffer subbuf2 = use_src2 ? src2_buf : src0_buf;
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, subbuf2, dst_buf }, pc, elements);
+-    } else if (op == GGML_OP_ROPE || op == GGML_OP_ROPE_BACK) {
++    } else if (op == GGML_OP_ROPE || op == GGML_OP_ROPE_BACK || op == GGML_OP_DSV4_ROPE_TAIL) {
+         // Empty src2 and src3 is possible in rope, but the shader needs a buffer
+         vk_subbuffer subbuf2 = use_src2 ? src2_buf : src0_buf;
+         vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
+@@ -11661,6 +11675,46 @@ static void ggml_vk_dsv4_fp8_kv_quantize(ggml_backend_vk_context * ctx, vk_conte
+     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_DSV4_FP8_KV_QUANTIZE, std::move(p));
+ }
+ 
++static void ggml_vk_dsv4_rope_tail(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
++    // op_params layout differs from GGML_OP_ROPE (no n_past / n_ctx slots), so build the
++    // shared rope push-constants directly from the dsv4_rope_tail params.
++    const int   n_dims      = ((const int32_t *) dst->op_params)[0];
++    const int   mode        = ((const int32_t *) dst->op_params)[1];
++    const int   n_ctx_orig  = ((const int32_t *) dst->op_params)[2];
++    const bool  inverse     = ((const int32_t *) dst->op_params)[3] != 0;
++    const float freq_base   = ((const float *)   dst->op_params)[4];
++    const float freq_scale  = ((const float *)   dst->op_params)[5];
++    const float ext_factor  = ((const float *)   dst->op_params)[6];
++    const float attn_factor = ((const float *)   dst->op_params)[7];
++    const float beta_fast   = ((const float *)   dst->op_params)[8];
++    const float beta_slow   = ((const float *)   dst->op_params)[9];
++
++    float corr_dims[2];
++    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
++
++    const float theta_scale = powf(freq_base, -2.0f/n_dims);
++
++    const uint32_t nb01 = src0->nb[1] / ggml_type_size(src0->type);
++    const uint32_t nb02 = src0->nb[2] / ggml_type_size(src0->type);
++    const uint32_t nb03 = src0->nb[3] / ggml_type_size(src0->type);
++    const uint32_t nb11 = dst->nb[1] / ggml_type_size(dst->type);
++    const uint32_t nb12 = dst->nb[2] / ggml_type_size(dst->type);
++    const uint32_t nb13 = dst->nb[3] / ggml_type_size(dst->type);
++
++    vk_op_rope_push_constants p {
++        (uint32_t)mode, (uint32_t)ggml_nrows(src0), (uint32_t)n_dims, freq_scale,
++        freq_base, ext_factor, attn_factor, {corr_dims[0], corr_dims[1]}, theta_scale, (uint32_t)(src2 != nullptr),
++        { 0, 0, 0, 0 }, 0u /*is_imrope*/, (uint32_t)inverse /*is_back carries the inverse flag*/, 0u /*set_rows_stride*/,
++        (uint32_t)src0->ne[0],
++        (uint32_t)src0->ne[1],
++        (uint32_t)src0->ne[2],
++        nb01, nb02, nb03,
++        nb11, nb12, nb13,
++    };
++
++    ggml_vk_op_f32<vk_op_rope_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_DSV4_ROPE_TAIL, std::move(p));
++}
++
+ static void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+     vk_op_sum_rows_push_constants pc = vk_op_sum_rows_push_constants_init(src0, dst, src0->ne[0]);
+     // Use the single pass shader when the rows are small or there are enough rows to fill the GPU.
+@@ -13290,6 +13344,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+     case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+         ggml_vk_dsv4_fp8_kv_quantize(ctx, compute_ctx, src0, node);
+ 
++        break;
++    case GGML_OP_DSV4_ROPE_TAIL:
++        ggml_vk_dsv4_rope_tail(ctx, compute_ctx, src0, src1, src2, node);
++
+         break;
+     case GGML_OP_CUMSUM:
+         ggml_vk_cumsum(ctx, compute_ctx, src0, node);
+@@ -15651,6 +15709,18 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_ROPE:
+             return ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0]);
++        case GGML_OP_DSV4_ROPE_TAIL:
++            // mirrors the Metal gate (ggml-metal-device.m), extended to F16 like the CPU op
++            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
++                op->type == op->src[0]->type &&
++                op->src[1]->type == GGML_TYPE_I32 &&
++                op->src[0]->ne[2] == op->src[1]->ne[0] &&
++                ggml_get_op_params_i32(op, 0) > 0 &&
++                ggml_get_op_params_i32(op, 0) <= op->src[0]->ne[0] &&
++                ggml_get_op_params_i32(op, 0) % 2 == 0 &&
++                (ggml_get_op_params_i32(op, 1) == GGML_ROPE_TYPE_NORMAL ||
++                 ggml_get_op_params_i32(op, 1) == GGML_ROPE_TYPE_NEOX) &&
++                ggml_is_contiguous_rows(op) && ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_ROPE_BACK:
+         case GGML_OP_NONE:
+         case GGML_OP_RESHAPE:
+@@ -16542,6 +16612,18 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+                     tensor_clone = ggml_rope_ext_back(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], n_dims, mode, n_ctx_orig_ggml, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                 }
+             }
++        } else if (tensor->op == GGML_OP_DSV4_ROPE_TAIL) {
++            const int   n_dims      = ((const int32_t *) tensor->op_params)[0];
++            const int   mode        = ((const int32_t *) tensor->op_params)[1];
++            const int   n_ctx_orig  = ((const int32_t *) tensor->op_params)[2];
++            const bool  inverse     = ((const int32_t *) tensor->op_params)[3] != 0;
++            const float freq_base   = ((const float *)   tensor->op_params)[4];
++            const float freq_scale  = ((const float *)   tensor->op_params)[5];
++            const float ext_factor  = ((const float *)   tensor->op_params)[6];
++            const float attn_factor = ((const float *)   tensor->op_params)[7];
++            const float beta_fast   = ((const float *)   tensor->op_params)[8];
++            const float beta_slow   = ((const float *)   tensor->op_params)[9];
++            tensor_clone = ggml_dsv4_rope_tail(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], n_dims, mode, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, inverse);
+         } else if (tensor->op == GGML_OP_UNARY) {
+             switch (ggml_get_unary_op(tensor)) {
+             case GGML_UNARY_OP_EXP:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_rope_tail.comp b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_rope_tail.comp
+new file mode 100644
+index 0000000..d12542c
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/dsv4_rope_tail.comp
+@@ -0,0 +1,83 @@
++#version 450
++
++#include "rope_head.glsl"
++#include "rope_funcs.glsl"
++
++// DeepSeek-V4 partial RoPE ("tail").
++//
++// Each row is [ne00] wide and splits into a "nope" prefix of n_nope = ne00 - n_dims
++// elements that is copied through unchanged, followed by an n_dims-wide tail that is
++// rotary-embedded exactly like a normal/neox RoPE over an n_dims head. This mirrors
++// ggml_compute_forward_dsv4_rope_tail (ggml-cpu/ops.cpp) and kernel_dsv4_rope_tail_f32
++// (ggml-metal.metal), and reuses the shared rope_yarn() so the numerics match the
++// mainline RoPE shaders (and therefore the CPU reference within tolerance).
++//
++// The `inverse` op flag is carried in pc.is_back: rope_yarn() negates theta when
++// is_back != 0, which flips the sign of sin while leaving cos unchanged - identical to
++// the CPU's sin_sign = -1 path.
++//
++// One thread per output element (gl_GlobalInvocationID.y == element index i0). n_nope
++// may be odd, so the copy region is handled element-wise. Each rotation is performed by
++// the thread that owns the first element of the pair, which also writes the partner.
++
++void main() {
++    const uint i0  = gl_GlobalInvocationID.y;
++    const uint row = gl_GlobalInvocationID.x + 32768 * gl_GlobalInvocationID.z;
++    if (row >= pc.nrows || i0 >= pc.ne00) {
++        return;
++    }
++
++    const uint i3 = row / (pc.ne01*pc.ne02);
++    const uint i2 = (row - i3 * pc.ne01*pc.ne02) / pc.ne01;
++    const uint i1 = (row - i3 * pc.ne01*pc.ne02 - i2 * pc.ne01);
++
++    // dim-0 stride is 1 element (contiguous rows, gated in supports_op)
++    const uint a_row = i3*pc.nb03 + i2*pc.nb02 + i1*pc.nb01;
++    const uint d_row = i3*pc.nb13 + i2*pc.nb12 + i1*pc.nb11;
++
++    const uint n_nope = pc.ne00 - pc.n_dims;
++
++    // nope prefix: straight pass-through copy
++    if (i0 < n_nope) {
++        rope_data_d[d_row + i0] = ROPE_D_TYPE(rope_data_a[a_row + i0]);
++        return;
++    }
++
++    const uint r = i0 - n_nope;                       // position within the tail, [0, n_dims)
++    const bool is_neox = (pc.rope_mode & 2u) != 0u;   // GGML_ROPE_TYPE_NEOX == 2
++
++    uint k;        // pair index, indexes freq factors
++    uint j0, j1;   // element offsets of the rotated pair within the row
++    uint i0_yarn;  // == 2*k, the ramp/theta index expected by rope_yarn (CPU cache i0)
++
++    if (is_neox) {
++        const uint n_half = pc.n_dims / 2;
++        if (r >= n_half) {
++            return;                                   // second half of a pair: written by its partner
++        }
++        k       = r;
++        j0      = n_nope + r;
++        j1      = n_nope + r + n_half;
++        i0_yarn = 2u * r;
++    } else {
++        if ((r & 1u) != 0u) {
++            return;                                   // odd element: written by its even partner
++        }
++        k       = r / 2u;
++        j0      = n_nope + r;
++        j1      = n_nope + r + 1u;
++        i0_yarn = r;
++    }
++
++    const float theta_base  = float(rope_data_pos[i2]) * pow(pc.theta_scale, float(i0_yarn)/2.0f);
++    const float freq_factor = pc.has_ff != 0 ? rope_data_ff[k] : 1.0f;
++
++    float cos_theta, sin_theta;
++    rope_yarn(theta_base / freq_factor, i0_yarn, cos_theta, sin_theta, pc);
++
++    const float x0 = float(rope_data_a[a_row + j0]);
++    const float x1 = float(rope_data_a[a_row + j1]);
++
++    rope_data_d[d_row + j0] = ROPE_D_TYPE(x0*cos_theta - x1*sin_theta);
++    rope_data_d[d_row + j1] = ROPE_D_TYPE(x0*sin_theta + x1*cos_theta);
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 58f0e1c..1f4ddd7 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -945,6 +945,9 @@ void process_shaders() {
+     string_to_spv("rope_vision_f32", "rope_vision.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
+     string_to_spv("rope_vision_f16", "rope_vision.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
+ 
++    string_to_spv("dsv4_rope_tail_f32", "dsv4_rope_tail.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
++    string_to_spv("dsv4_rope_tail_f16", "dsv4_rope_tail.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
++
+     string_to_spv("argsort_f32", "argsort.comp", {{"A_TYPE", "float"}});
+     string_to_spv("argsort_large_f32", "argsort_large.comp", {{"A_TYPE", "float"}});
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 515d842..a5cc51e 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4383,6 +4383,88 @@ struct test_dsv4_fp8_kv_quantize : public test_case {
+     }
+ };
+ 
++// GGML_OP_DSV4_ROPE_TAIL
++struct test_dsv4_rope_tail : public test_case {
++    const ggml_type type;
++    const std::array<int64_t, 4> ne; // [n_embd_head, n_head, n_tokens, batch]
++    const int n_dims;    // n_rot: width of the roped tail; the leading ne0 - n_dims are copied through
++    const int mode;      // GGML_ROPE_TYPE_NORMAL or GGML_ROPE_TYPE_NEOX
++    const int n_ctx;     // used to generate positions
++    const float fs;      // freq_scale
++    const float ef;      // ext_factor
++    const float af;      // attn_factor
++    const bool ff;       // freq_factors present
++    const bool inverse;  // un-RoPE (negates sin)
++    const int v;         // view (1 : non-contiguous a)
++
++    std::string vars() override {
++        return VARS_TO_STR11(type, ne, n_dims, mode, n_ctx, fs, ef, af, ff, inverse, v);
++    }
++
++    test_dsv4_rope_tail(ggml_type type = GGML_TYPE_F32,
++            std::array<int64_t, 4> ne = {576, 2, 7, 1},
++            int n_dims = 64, int mode = GGML_ROPE_TYPE_NEOX, int n_ctx = 512,
++            float fs = 1.0f, float ef = 0.0f, float af = 1.0f,
++            bool ff = false, bool inverse = false, int v = 0)
++        : type(type), ne(ne), n_dims(n_dims), mode(mode), n_ctx(n_ctx),
++          fs(fs), ef(ef), af(af), ff(ff), inverse(inverse), v(v) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a;
++        if (v & 1) {
++            auto ne_big = ne; ne_big[0] *= 2; ne_big[1] *= 4; ne_big[2] *= 3;
++            a = ggml_new_tensor(ctx, type, 4, ne_big.data());
++            ggml_set_name(a, "a");
++
++            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
++            ggml_set_name(a, "view_of_a");
++        } else {
++            a = ggml_new_tensor(ctx, type, 4, ne.data());
++            ggml_set_name(a, "a");
++        }
++
++        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
++        ggml_set_name(pos, "pos");
++
++        ggml_tensor * freq = nullptr;
++        if (ff) {
++            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims/2);
++            ggml_set_name(freq, "freq");
++        }
++
++        ggml_tensor * out = ggml_dsv4_rope_tail(ctx, a, pos, freq, n_dims, mode, 0,
++                10000.0f, fs, ef, af, 1.0f, 1.0f, inverse);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                // pos
++                const int n_pos = (int) ne[2];
++                std::vector<int> data(n_pos);
++                for (int i = 0; i < n_pos; i++) {
++                    data[i] = rand() % n_ctx;
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, n_pos * sizeof(int));
++            } else {
++                if (t->ne[0] == n_dims/2) {
++                    // frequency factors in the range [0.9f, 1.1f]
++                    init_tensor_uniform(t, 0.9f, 1.1f);
++                } else {
++                    init_tensor_uniform(t);
++                }
++            }
++        }
++    }
++
++    double max_maa_err() override {
++        return 1e-3;
++    }
++};
++
+ // GGML_OP_FLOOR
+ struct test_floor : public test_case {
+     const ggml_type type;
+@@ -8334,6 +8416,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_dsv4_fp8_kv_quantize(GGML_TYPE_F32, {576, 8, 512, 1}, 64));
+     test_cases.emplace_back(new test_dsv4_fp8_kv_quantize(GGML_TYPE_F32, {576, 1, 4, 1}, 64, 0, true));
+ 
++    // DSV4_ROPE_TAIL: head n_embd_head_k = 576 = 512 nope + 64 rot (n_rot); q = [576, n_head, n_tokens], kv = [576, 1, n_tokens]
++    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
++        for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {
++            for (bool inv : {false, true}) {
++                test_cases.emplace_back(new test_dsv4_rope_tail(type, {576, 1, 7, 1}, 64, mode, 512, 1.0f, 0.0f, 1.0f, false, inv, 0)); // kv
++                test_cases.emplace_back(new test_dsv4_rope_tail(type, {576, 4, 3, 1}, 64, mode, 512, 1.0f, 0.0f, 1.0f, false, inv, 0)); // q
++            }
++        }
++    }
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 2, 7, 1}, 64, GGML_ROPE_TYPE_NEOX,   512, 1.0f,    0.0f,    1.0f,    true,  false, 0)); // freq_factors
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 2, 7, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f,    0.0f,    1.0f,    true,  true,  0)); // freq_factors + inverse
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 2, 7, 1}, 64, GGML_ROPE_TYPE_NEOX,   512, 1.0f,    0.0f,    1.0f,    false, false, 1)); // non-contiguous a
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F16, {576, 2, 7, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f,    0.0f,    1.0f,    false, false, 1)); // non-contiguous a, f16
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 2, 7, 1}, 64, GGML_ROPE_TYPE_NEOX,   512, 1.4245f, 0.7465f, 1.4245f, false, false, 0)); // YaRN
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 2, 7, 1}, 64, GGML_ROPE_TYPE_NEOX,   512, 1.4245f, 0.7465f, 1.4245f, false, true,  0)); // YaRN + inverse
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 4, 3, 2}, 64, GGML_ROPE_TYPE_NEOX,   512, 1.0f,    0.0f,    1.0f,    false, false, 0)); // batch (ne3 > 1)
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, { 99, 2, 3, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.0f,    0.0f,    1.0f,    false, false, 0)); // odd n_nope = 35
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {128, 4, 2, 1}, 64, GGML_ROPE_TYPE_NEOX,   512, 1.0f,    0.0f,    1.0f,    false, false, 0)); // n_nope = 64
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, { 96, 2, 3, 1}, 32, GGML_ROPE_TYPE_NEOX,   512, 1.0f,    0.0f,    1.0f,    false, false, 0)); // n_dims = 32
++    test_cases.emplace_back(new test_dsv4_rope_tail(GGML_TYPE_F32, {576, 8, 512, 1}, 64, GGML_ROPE_TYPE_NEOX, 512, 1.0f,    0.0f,    1.0f,    false, false, 0)); // 4096-row split
++
+ #if 0
+     std::uniform_int_distribution<> dist_ne1(1, 50);
+     int exponent = 1;

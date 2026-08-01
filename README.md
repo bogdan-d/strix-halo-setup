@@ -67,6 +67,15 @@ systemctl --user start llama-server comfyui
 
 For NPU setup, see [NPU Setup](#npu-setup) below.
 
+### Vulkan kernels for the DeepSeek-V4 ops
+
+Five compute shaders implementing DSv4's custom GGML operations on Vulkan — the first
+such implementations I can find, since upstream is adding them CPU-only and the fork
+they target ships CPU + Metal. 1,153 insertions, 64 numerics tests, verified on gfx1151.
+Applying them takes a fork that produced **zero tokens in 30 minutes** to coherent
+generation at 12.3 t/s. Patch series + apply instructions:
+[`patches/vulkan-dsv4-kernels/`](patches/vulkan-dsv4-kernels/).
+
 ## DeepSeek V4 Flash (284B) — frontier-scale, fully local
 
 A **284B-parameter model at full 131k context** on this box, GPU-offloaded via Vulkan,
