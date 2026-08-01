@@ -155,16 +155,26 @@ mode.
 
 ### Scoreboard
 
-Same specification, same automated judge, verified-identical prompt:
+Same specification, verified-identical prompt. All rows except the last are the
+automated 14-check judge; the 35B row is a human-play verdict (see correction below):
 
 | model | result | time |
 |---|---|---|
 | DeepSeek-V4-284B, uniform 2-bit | 0 of 14 checks reached | 44 min |
 | DeepSeek-V4-284B, Q8-attention quant | 4 of 14 | 55 min |
 | Qwen3.6-27B, reasoning-distilled | 6 of 14 | 10 min |
-| Qwen3.6-35B-A3B, reasoning-distilled | **working game, first try** | 77 sec |
+| Qwen3.6-35B-A3B, reasoning-distilled | playable first try (human-judged)* | 77 sec |
 
-The 35B is roughly **43× faster and correct**. That is the practical verdict.
+The 35B is roughly **43× faster** and produced the only build a human called playable.
+That is the practical verdict.
+
+\* **Correction (same day, after re-running the judge on the archived artifacts):** the
+35B row was a human-play verdict, not the automated judge's. Its first-try build
+predates the judge's testability contract and scores 0-of-14-reached on it (the game
+plays, but exposes none of the required test hooks); the fix-rounds final scores
+9 of 14. The 77-second figure is real, but the row is not same-judge comparable with
+the rows above. For the record, the best *cold* score this judge has ever given is
+6 of 14 at 68 t/s, by a Fable-5 distill of the same 35B base tested later the same day.
 
 It does write large coherent programs: a complete self-contained Pac-Man (canvas, four
 ghosts, collision, score, game loop, balanced braces, closing `</html>`) in ~12 minutes
