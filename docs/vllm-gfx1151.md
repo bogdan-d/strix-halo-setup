@@ -86,6 +86,25 @@ Number 4 is the expensive one. It reads exactly like "gfx1151 has no ROCm paged
 attention kernel" and sends you into upstream issue threads. It is not a missing
 kernel. It is a missing `CC`.
 
+**Nothing here needs compiling or patching.** The bundle is prebuilt and is used
+exactly as shipped — no source changes, no rebuilt wheels, no custom container.
+Both hand-fixes that seemed necessary while bypassing the shim were confirmed
+unnecessary once under it:
+
+```sh
+# with the shim's env applied, the shipped packages import fine:
+#   flash_attn   IMPORT OK   2.8.3
+#   amdsmi       IMPORT OK   26.5.0
+```
+
+So do not write an amdsmi shim, and do not move `flash_attn` aside. Both are
+symptoms of the wrong launcher, not of a broken bundle.
+
+> **Caveat on the numbers above:** the benchmarked run was made while
+> `flash_attn` was still renamed out of the way from earlier debugging. The
+> import test proves the rename was never needed, but a full serve run with the
+> package present has not been re-measured. Expect the same or better.
+
 ### 2. `--gpu-memory-utilization` is a fraction of TOTAL memory
 
 Not of *free* memory. On a 128 GB box already running llama-server on :8001, a
