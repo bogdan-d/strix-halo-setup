@@ -133,6 +133,37 @@ apps that hit `:8001` directly with a **small `max_tokens`** must send
 `content` comes back empty — Claude Code sends large budgets, so it's unaffected. Audit
 small-budget callers before swapping Gemma → Qwen3.6.
 
+## vLLM on gfx1151 — many-user serving
+
+**vLLM runs on Strix Halo.** Serving and generating, verified 2026-08-03 via the
+[lemonade-sdk/vllm-rocm](https://github.com/lemonade-sdk/vllm-rocm) qualified bundle with
+Qwen3.6-27B-AWQ-INT4. This is the workload llama.cpp with `--parallel 1` does not cover:
+**111 t/s aggregate across 32 concurrent users** (19.6x scaling over single-stream), on one
+desktop-class box. Full writeup: [`docs/vllm-gfx1151.md`](docs/vllm-gfx1151.md).
+
+```bash
+bin/vllm-serve-strix.sh                 # defaults: AWQ 27B, :8107, eager, max_num_seqs 256
+MEM_FRAC=0.5 PORT=8107 bin/vllm-serve-strix.sh /path/to/hf-model
+```
+
+| concurrency | aggregate t/s | per-user t/s |
+|---|---|---|
+| 1  | 5.66  | 5.66 |
+| 8  | 38.6  | 4.84 |
+| 16 | 71.3  | 4.46 |
+| 32 | 111.2 | 3.48 |
+
+- **Do not use it as a daily driver.** `:8001` (35B-A3B MoE + MTP) does 66–86 t/s
+  single-stream — roughly 10x faster for one developer. vLLM's win is concurrency only.
+- **These are floor numbers** — measured with `--enforce-eager`, so torch.compile *and* HIP
+  graph capture were disabled. Graph capture is untried on purpose:
+  [vllm-project#32180](https://github.com/vllm-project/vllm/issues/32180) reports it hanging
+  the gfx1151 driver, which would take every other GPU service down with it.
+- **The one rule:** launch through the bundle's own `bin/vllm-server` shim. Every "packaging
+  bug" worth hours — `Failed to infer device type`, a CUDA `flash_attn` import error,
+  `EngineDeadError` in `kernel_paged_attention_2d` — is really that shim's missing env
+  (`CC`, the real amdsmi, `LD_LIBRARY_PATH`), not a gfx1151 defect.
+
 ## Performance benchmarks
 
 ### LLM inference
@@ -516,13 +547,17 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 ├── bin/
 │   ├── llama-server-wrapper.sh           # LD_LIBRARY_PATH wrapper for Vulkan binary
 │   ├── sd-server-wrapper.sh              # LD_LIBRARY_PATH wrapper for sd-cpp binary
-│   └── strix-llm-switch.sh               # Flip :8001 between Qwen3.6 MTP and Gemma
+│   ├── strix-llm-switch.sh               # Flip :8001 between Qwen3.6 MTP and Gemma
+│   └── vllm-serve-strix.sh               # vLLM via the lemonade bundle (concurrent serving)
 ├── configs/
 │   └── claude-code-router.config.json    # ccr config → local :8001 (secrets redacted)
 ├── docs/
 │   ├── claude-code-local-qwen3.6-mtp.md  # Claude Code on local Qwen3.6 (full writeup)
 │   ├── comfyui-qwen-image.md             # Qwen-Image GGUF workflow notes
-│   └── unsloth-rocm-gfx1151.md           # Fine-tuning: Unsloth on ROCm, multimodal LoRA, GGUF
+│   ├── deepseek-v4-flash-284b.md         # DeepSeek V4 Flash 284B: Vulkan config, numbers, traps
+│   ├── strix-guard.md                    # Remote kill-switch / stack guard
+│   ├── unsloth-rocm-gfx1151.md           # Fine-tuning: Unsloth on ROCm, multimodal LoRA, GGUF
+│   └── vllm-gfx1151.md                   # vLLM on gfx1151: what blocks it, measured throughput
 ├── tools/
 │   └── cc-qwen-vs-opus.sh                # Head-to-head test harness (local Qwen3.6 vs Opus)
 ├── workflows/
