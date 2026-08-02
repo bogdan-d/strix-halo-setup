@@ -100,10 +100,20 @@ unnecessary once under it:
 So do not write an amdsmi shim, and do not move `flash_attn` aside. Both are
 symptoms of the wrong launcher, not of a broken bundle.
 
-> **Caveat on the numbers above:** the benchmarked run was made while
-> `flash_attn` was still renamed out of the way from earlier debugging. The
-> import test proves the rename was never needed, but a full serve run with the
-> package present has not been re-measured. Expect the same or better.
+The whole sweep was then re-measured with `flash_attn` restored to shipped state
+and launched via `bin/vllm-serve-strix.sh`, to confirm the published numbers did
+not depend on that rename. They do not — every point landed within noise:
+
+| concurrency | flash_attn moved aside | flash_attn present | delta |
+|---|---|---|---|
+| 1  | 5.66  | 5.63   | -0.6% |
+| 8  | 38.6  | 39.74  | +3.0% |
+| 16 | 71.3  | 70.95  | -0.5% |
+| 32 | 111.2 | 110.83 | -0.3% |
+
+The engine log confirms the restored package is genuinely in use
+(`Using Flash Attention (Triton backend) for ViT model on RDNA`), so this is a
+real comparison rather than two runs of the same configuration.
 
 ### 2. `--gpu-memory-utilization` is a fraction of TOTAL memory
 
