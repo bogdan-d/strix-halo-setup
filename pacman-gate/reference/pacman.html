@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Pac-Man — reference build</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:#000; color:#fff;
+    font-family: system-ui,-apple-system,"Segoe UI",sans-serif; overflow:hidden;
+    touch-action:none; -webkit-user-select:none; user-select:none; }
+  #wrap { height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; }
+  canvas { display:block; max-width:100vw; height:auto; image-rendering:auto; }
+  #hud { font-size:15px; letter-spacing:.06em; font-variant-numeric:tabular-nums; }
+  #hud b { color:#ffd23f; font-weight:600; }
+  .overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:16px; background:rgba(0,0,0,.82); text-align:center; padding:24px; }
+  .overlay h1 { color:#ffd23f; font-size:clamp(28px,9vw,52px); letter-spacing:.12em; }
+  .overlay p { color:#9aa; font-size:15px; line-height:1.5; }
+  .btn { background:#ffd23f; color:#000; border:0; border-radius:999px; padding:14px 40px;
+    font-size:18px; font-weight:700; letter-spacing:.08em; cursor:pointer; touch-action:manipulation; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <div id="hud">SCORE <b id="hScore">0</b> &nbsp; LIVES <b id="hLives">3</b> &nbsp; DOTS <b id="hDots">0</b></div>
+</div>
+
+<div id="startScreen" class="overlay">
+  <h1>PAC-MAN</h1>
+  <p>Arrow keys or swipe to move.<br>Eat the dots, avoid the ghosts, grab a power pellet.</p>
+  <button class="btn" id="playBtn">PLAY</button>
+</div>
+
+<div id="endScreen" class="overlay hidden">
+  <h1 id="endTitle">GAME OVER</h1>
+  <p>Final score <b id="endScore">0</b></p>
+  <button class="btn" id="againBtn">PLAY AGAIN</button>
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   REFERENCE Pac-Man — the calibration standard for gate.py.
+   Written 2026-08-02 because the gate had never been validated against a
+   known-good build: a model produced a game that moved ONE cell and stopped,
+   yet scored 10/14. An instrument that has never seen a correct answer cannot
+   grade a wrong one. This file is that correct answer.
+   Every SPEC.md line is implemented; every testability-contract name is a
+   real top-level binding, not a stub.
+   ========================================================================= */
+
+/* ---- fixed timestep: every duration below is SECONDS, converted here ------ */
+const MOVE_INTERVAL = 0.14;                 // seconds per cell step
+const TICKS = s => Math.round(s * 1000 / (MOVE_INTERVAL * 1000)); // seconds -> steps
+const POWER_SECONDS   = 7;
+const POWER_BLINK_SEC = 2;
+const HOUSE_EXIT_SEC  = { blinky: 0, pinky: 0.5, inky: 1.5, clyde: 2.5 };
+const EATEN_RESPAWN_SEC = 3;
+const DEATH_PAUSE_SEC = 1;
+const CELL = 22;
+
+/* ---- maze: 21 rows x 21 cols. 0 empty 1 wall 2 dot 3 pellet 4 house 5 door - */
+const MAZE_SRC = [
+  "111111111111111111111",
+  "132221222222222122231",
+  "121121211121112121121",
+  "122221222212222122221",
+  "121121211222112121121",
+  "121121222222222121121",
+  "122221111222111122221",
+  "111121222222222121111",
+  "000121211121112121000",
+  "111121211151112121111",
+  "000002211444112200000",
+  "111121211111112121111",
+  "000121211111112121000",
+  "111121222222222121111",
+  "122221111212111122221",
+  "121121222222222121121",
+  "121121211212112121121",
+  "122221222222222122221",
+  "121121211111112121121",
+  "132221222222222122231",
+  "111111111111111111111",
+];
+
+/* ---- TESTABILITY CONTRACT: top-level state (SPEC.md §Testability) --------- */
+let maze = [];
+let pacman = null;
+let ghosts = [];
+let score = 0;
+let lives = 3;
+let powerMode = false;
+let gameState = "start";        // start | playing | dead | win | over
+let dotCount = 0;               // dots EATEN (gate asserts +1 per dot)
+let totalDots = 0;
+
+/* ---- internals ----------------------------------------------------------- */
+const ROWS = MAZE_SRC.length, COLS = MAZE_SRC[0].length;
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+canvas.width = COLS * CELL; canvas.height = ROWS * CELL;
+
+let powerTicks = 0, comboCount = 0, deathPause = 0, stepAcc = 0, lastTime = 0, mouthPhase = 0;
+// Scatter/chase waves (arcade behaviour): ghosts retreat to their corners on a
+// schedule instead of hunting relentlessly. Seconds, converted via TICKS.
+const WAVES = [ ["scatter",7], ["chase",20], ["scatter",7], ["chase",20], ["scatter",5], ["chase",0] ];
+let waveIndex = 0, waveTicks = 0, ghostMode = "scatter";
+const GHOST_META = [
+  { name:"blinky", color:"#ff3b30", scatter:{x:COLS-2, y:1} },
+  { name:"pinky",  color:"#ff9ad5", scatter:{x:1,      y:1} },
+  { name:"inky",   color:"#4fd8ff", scatter:{x:COLS-2, y:ROWS-2} },
+  { name:"clyde",  color:"#ffb340", scatter:{x:1,      y:ROWS-2} },
+];
+const HOUSE = { x:10, y:10 };
+const DIRS = [ {x:1,y:0}, {x:-1,y:0}, {x:0,y:1}, {x:0,y:-1} ];
+
+function buildMaze() {
+  maze = MAZE_SRC.map(row => row.split("").map(ch => {
+    const n = parseInt(ch, 10);
+    return Number.isNaN(n) ? 0 : n;
+  }));
+  totalDots = 0;
+  for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++)
+    if (maze[r][c] === 2 || maze[r][c] === 3) totalDots++;
+}
+function walkable(x, y, forGhost) {
+  if (y < 0 || y >= ROWS) return false;
+  const v = maze[y][(x + COLS) % COLS];
+  if (v === 1) return false;
+  if (v === 5) return !!forGhost;      // only ghosts pass the house door
+  return true;
+}
+function wrapX(x) { return (x + COLS) % COLS; }
+function cellDist(a, b) { const dx=a.x-b.x, dy=a.y-b.y; return Math.hypot(dx, dy); }
+
+/* prev is initialised AT CREATION and reset on every teleport (SPEC.md) */
+function makePacman() {
+  return { x:11, y:15, prev:{x:11,y:15}, dir:{x:0,y:0}, nextDir:{x:0,y:0}, teleported:false };
+}
+function makeGhost(i) {
+  const m = GHOST_META[i];
+  const start = i === 0 ? { x:HOUSE.x, y:HOUSE.y-2 } : { x:HOUSE.x + (i-2), y:HOUSE.y };
+  return { name:m.name, color:m.color, scatter:m.scatter,
+           x:start.x, y:start.y, prev:{x:start.x, y:start.y},
+           dir:{x:0,y:-1}, inHouse:i !== 0, exitTicks:TICKS(HOUSE_EXIT_SEC[m.name]),
+           frightened:false, eaten:false, teleported:false, slowFlip:false };
+}
+function setupGhosts() { ghosts = [0,1,2,3].map(makeGhost); }
+
+/* ---- TESTABILITY CONTRACT: top-level function declarations --------------- */
+function startGame() {
+  buildMaze();
+  score = 0; lives = 3; dotCount = 0; powerMode = false; powerTicks = 0;
+  comboCount = 0; deathPause = 0; stepAcc = 0;
+  waveIndex = 0; ghostMode = WAVES[0][0]; waveTicks = TICKS(WAVES[0][1]);
+  pacman = makePacman(); setupGhosts();
+  gameState = "playing";
+  document.getElementById("startScreen").classList.add("hidden");
+  document.getElementById("endScreen").classList.add("hidden");
+  updateHud();
+}
+
+function movePacman() {
+  // Queued turn applied at any cell where the turn is walkable (SPEC.md).
+  // The requested direction is retried every step and is NOT cleared once
+  // applied: that is what lets pac-man round a corner the instant it opens and
+  // resume after a wall, instead of stopping dead until the next keypress.
+  const nd = pacman.nextDir;
+  if ((nd.x || nd.y) && walkable(pacman.x + nd.x, pacman.y + nd.y, false)) {
+    pacman.dir = { x:nd.x, y:nd.y };
+    pacman.nextDir = { x:0, y:0 };
+  }
+  const d = pacman.dir;
+  if (!d.x && !d.y) return;
+  const nx = pacman.x + d.x, ny = pacman.y + d.y;
+  if (!walkable(nx, ny, false)) return;   // hold direction; retry next step
+
+  pacman.prev = { x:pacman.x, y:pacman.y };
+  pacman.teleported = (nx < 0 || nx >= COLS);   // tunnel wrap: skip interpolation
+  pacman.x = wrapX(nx); pacman.y = ny;
+
+  const v = maze[pacman.y][pacman.x];
+  if (v === 2) { maze[pacman.y][pacman.x] = 0; score += 10;  dotCount++; }
+  if (v === 3) {
+    maze[pacman.y][pacman.x] = 0; score += 50; dotCount++;
+    powerMode = true; powerTicks = TICKS(POWER_SECONDS); comboCount = 0;
+    for (const g of ghosts) if (!g.eaten) g.frightened = true;
+  }
+  if (dotCount >= totalDots) endGame(true);
+}
+
+function moveGhost(g) {
+  // Frightened ghosts move at half speed (arcade behaviour) — otherwise they
+  // are uncatchable and the power pellet is decorative.
+  if (g.frightened && !g.eaten) { g.slowFlip = !g.slowFlip; if (g.slowFlip) return; }
+  if (g.inHouse) {
+    if (g.exitTicks > 0) { g.exitTicks--; return; }
+    // Staged exit: slide to the door column first, then step up and out. A
+    // single teleport made every ghost contend for one cell, so whoever lost
+    // simply sat in the house forever.
+    g.prev = { x:g.x, y:g.y };
+    if (g.x !== HOUSE.x) {
+      g.teleported = false;
+      g.x += Math.sign(HOUSE.x - g.x);
+      g.dir = { x:Math.sign(HOUSE.x - g.x) || 1, y:0 };
+      return;
+    }
+    g.teleported = true;                      // through the door: a teleport
+    g.x = HOUSE.x; g.y = HOUSE.y - 2;
+    g.inHouse = false; g.dir = { x:0, y:-1 };
+    return;
+  }
+  // Target selection — classic personalities (SPEC.md).
+  let target;
+  if (g.eaten) target = { x:HOUSE.x, y:HOUSE.y };
+  else if (g.frightened) {
+    // Flee weakly: a point opposite pacman a few cells away, not a distant
+    // corner. A ghost sprinting to a corner is uncatchable, which makes the
+    // power pellet decorative.
+    target = { x: g.x + (g.x - pacman.x), y: g.y + (g.y - pacman.y) };
+  }
+  else if (ghostMode === "scatter") target = g.scatter;
+  else if (g.name === "blinky") target = { x:pacman.x, y:pacman.y };
+  else if (g.name === "pinky")  target = { x:pacman.x + pacman.dir.x*4, y:pacman.y + pacman.dir.y*4 };
+  else if (g.name === "inky") {
+    const b = ghosts[0];
+    const ahead = { x:pacman.x + pacman.dir.x*2, y:pacman.y + pacman.dir.y*2 };
+    target = { x:ahead.x*2 - b.x, y:ahead.y*2 - b.y };
+  } else {
+    target = cellDist(g, pacman) > 8 ? { x:pacman.x, y:pacman.y } : g.scatter;
+  }
+  // Decision at EVERY cell step: walkable, non-reverse, minimise distance.
+  const back = { x:-g.dir.x, y:-g.dir.y };
+  let best = null, bestD = Infinity;
+  for (const d of DIRS) {
+    if (d.x === back.x && d.y === back.y) continue;
+    const nx = wrapX(g.x + d.x), ny = g.y + d.y;
+    if (!walkable(nx, ny, true)) continue;
+    const dist = cellDist({ x:nx, y:ny }, target);
+    if (dist < bestD) { bestD = dist; best = d; }
+  }
+  if (!best) best = back;                    // dead end: reverse
+  const nx = g.x + best.x, ny = g.y + best.y;
+  if (!walkable(wrapX(nx), ny, true)) return;
+  g.prev = { x:g.x, y:g.y };
+  g.teleported = (nx < 0 || nx >= COLS);
+  g.x = wrapX(nx); g.y = ny; g.dir = best;
+
+  if (g.eaten && g.x === HOUSE.x && Math.abs(g.y - HOUSE.y) <= 1) {
+    g.eaten = false; g.frightened = false; g.inHouse = true;
+    g.exitTicks = TICKS(EATEN_RESPAWN_SEC);
+    g.prev = { x:g.x, y:g.y }; g.teleported = true;
+  }
+}
+
+function checkGhostCollisions() {
+  for (const g of ghosts) {
+    if (g.inHouse || g.eaten) continue;
+    const same = (g.x === pacman.x && g.y === pacman.y);
+    // Cell-swap: pacman and ghost exchanged cells in one step (SPEC.md).
+    const swapped = (g.x === pacman.prev.x && g.y === pacman.prev.y &&
+                     g.prev.x === pacman.x && g.prev.y === pacman.y);
+    if (!same && !swapped) continue;
+    if (powerMode || g.frightened) {
+      // Respawn in the house immediately (SPEC: "Eaten ghosts respawn in
+      // house, exit after 3s"), then serve the exit timer like a fresh ghost.
+      g.eaten = false; g.frightened = false; g.inHouse = true;
+      g.x = HOUSE.x; g.y = HOUSE.y; g.prev = { x:g.x, y:g.y }; g.teleported = true;
+      g.exitTicks = TICKS(EATEN_RESPAWN_SEC);
+      score += 200 * Math.pow(2, comboCount); comboCount++;
+      updateHud();
+    } else {
+      loseLife(); return;
+    }
+  }
+}
+
+/* ---- lifecycle ----------------------------------------------------------- */
+function loseLife() {
+  lives--;
+  updateHud();
+  if (lives <= 0) { endGame(false); return; }
+  gameState = "dead";
+  deathPause = TICKS(DEATH_PAUSE_SEC);
+  pacman = makePacman();            // fresh object => prev reset at creation
+  setupGhosts();
+  // Deaths must not rewind the wave clock; that is what kept inky/clyde
+  // permanently housed when the player idled and died repeatedly.
+  ghostMode = "scatter"; waveTicks = TICKS(3);
+  powerMode = false; powerTicks = 0;
+}
+function endGame(won) {
+  gameState = won ? "win" : "over";
+  document.getElementById("endTitle").textContent = won ? "YOU WIN" : "GAME OVER";
+  document.getElementById("endScore").textContent = String(score);
+  document.getElementById("endScreen").classList.remove("hidden");
+}
+function updateHud() {
+  document.getElementById("hScore").textContent = String(score);
+  document.getElementById("hLives").textContent = String(lives);
+  document.getElementById("hDots").textContent = String(dotCount);
+}
+
+function step() {
+  if (gameState === "dead") { if (--deathPause <= 0) gameState = "playing"; return; }
+  if (gameState !== "playing") return;
+  movePacman();
+  for (const g of ghosts) moveGhost(g);
+  checkGhostCollisions();
+  if (!powerMode && waveTicks > 0 && --waveTicks <= 0 && waveIndex < WAVES.length-1) {
+    waveIndex++; ghostMode = WAVES[waveIndex][0]; waveTicks = TICKS(WAVES[waveIndex][1]);
+  }
+  if (powerMode && --powerTicks <= 0) {
+    powerMode = false;
+    for (const g of ghosts) g.frightened = false;
+  }
+  updateHud();
+}
+
+/* ---- rendering: interpolated between prev and current cell ---------------- */
+function lerpPos(e, f) {
+  if (e.teleported) return { x:e.x, y:e.y };
+  return { x: e.prev.x + (e.x - e.prev.x) * f, y: e.prev.y + (e.y - e.prev.y) * f };
+}
+function draw(f) {
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // maze: rounded corridor-style walls, not solid blocks
+  for (let r=0; r<ROWS; r++) for (let c=0; c<COLS; c++) {
+    const v = maze[r][c];
+    if (v === 1) {
+      ctx.fillStyle = "#1b2a8a";
+      ctx.strokeStyle = "#3f5bd6"; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.roundRect(c*CELL+3, r*CELL+3, CELL-6, CELL-6, 5);
+      ctx.fill(); ctx.stroke();
+    } else if (v === 5) {
+      ctx.fillStyle = "#ff9ad5";
+      ctx.fillRect(c*CELL+2, r*CELL+CELL/2-2, CELL-4, 4);
+    } else if (v === 2) {
+      ctx.fillStyle = "#ffe9a8";
+      ctx.beginPath(); ctx.arc(c*CELL+CELL/2, r*CELL+CELL/2, 2.5, 0, Math.PI*2); ctx.fill();
+    } else if (v === 3) {
+      const pulse = powerMode ? 1 : (0.75 + 0.25*Math.sin(Date.now()/220));
+      ctx.fillStyle = "#ffd23f";
+      ctx.beginPath(); ctx.arc(c*CELL+CELL/2, r*CELL+CELL/2, 6*pulse, 0, Math.PI*2); ctx.fill();
+    }
+  }
+  // ghosts: dome + skirt + eyes (NOT circles)
+  for (const g of ghosts) {
+    const p = lerpPos(g, f), gx = p.x*CELL+CELL/2, gy = p.y*CELL+CELL/2, R = CELL/2-2;
+    const blinking = powerMode && powerTicks < TICKS(POWER_BLINK_SEC) && Math.floor(Date.now()/180)%2===0;
+    ctx.fillStyle = g.eaten ? "rgba(255,255,255,.20)"
+                  : g.frightened ? (blinking ? "#ffffff" : "#2b39ff") : g.color;
+    ctx.beginPath();
+    ctx.arc(gx, gy-1, R, Math.PI, 0);                 // dome
+    ctx.lineTo(gx+R, gy+R-2);
+    for (let i=0; i<3; i++) {                          // skirt
+      const w = (2*R)/3;
+      ctx.lineTo(gx+R-w*i-w/2, gy+R-6);
+      ctx.lineTo(gx+R-w*(i+1), gy+R-2);
+    }
+    ctx.closePath(); ctx.fill();
+    const look = g.dir;
+    ctx.fillStyle = "#fff";
+    for (const ex of [-4.5, 4.5]) {
+      ctx.beginPath(); ctx.ellipse(gx+ex, gy-2, 3.2, 4, 0, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.fillStyle = g.frightened ? "#ff3b30" : "#12143a";
+    for (const ex of [-4.5, 4.5]) {
+      ctx.beginPath(); ctx.arc(gx+ex+look.x*1.6, gy-2+look.y*1.6, 1.8, 0, Math.PI*2); ctx.fill();
+    }
+  }
+  // pac-man: arc with an ANIMATED MOUTH WEDGE facing travel direction
+  const pp = lerpPos(pacman, f);
+  const px = pp.x*CELL+CELL/2, py = pp.y*CELL+CELL/2, PR = CELL/2-1;
+  const moving = pacman.dir.x || pacman.dir.y;
+  const mouth = moving ? (0.06 + 0.30*Math.abs(Math.sin(mouthPhase))) : 0.30;
+  const facing = Math.atan2(pacman.dir.y, pacman.dir.x) || 0;
+  ctx.fillStyle = "#ffd23f";
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.arc(px, py, PR, facing + mouth*Math.PI, facing - mouth*Math.PI);
+  ctx.closePath(); ctx.fill();
+}
+
+/* ---- accumulator loop over rAF (fixed-timestep logic) -------------------- */
+function frame(now) {
+  if (!lastTime) lastTime = now;
+  const dt = Math.min((now - lastTime) / 1000, 0.25);
+  lastTime = now;
+  if (gameState === "playing" || gameState === "dead") {
+    stepAcc += dt;
+    while (stepAcc >= MOVE_INTERVAL) { stepAcc -= MOVE_INTERVAL; step(); }
+    mouthPhase += dt * 9;
+  }
+  draw(Math.min(stepAcc / MOVE_INTERVAL, 1));
+  requestAnimationFrame(frame);
+}
+
+/* ---- input: keyboard + swipe, both click and touch on buttons ------------ */
+addEventListener("keydown", e => {
+  const map = { ArrowRight:{x:1,y:0}, ArrowLeft:{x:-1,y:0}, ArrowDown:{x:0,y:1}, ArrowUp:{x:0,y:-1} };
+  if (map[e.key]) { pacman && (pacman.nextDir = map[e.key]); e.preventDefault(); }
+}, { passive:false });
+
+let touchStart = null;
+function onTouchStart(e) { const t = e.changedTouches[0]; touchStart = { x:t.clientX, y:t.clientY }; e.preventDefault(); }
+function onTouchEnd(e) {
+  if (!touchStart || !pacman) return;
+  const t = e.changedTouches[0];
+  const dx = t.clientX - touchStart.x, dy = t.clientY - touchStart.y;
+  if (Math.hypot(dx, dy) >= 30) {
+    pacman.nextDir = Math.abs(dx) > Math.abs(dy) ? { x:Math.sign(dx), y:0 } : { x:0, y:Math.sign(dy) };
+  }
+  touchStart = null; e.preventDefault();
+}
+for (const el of [document.body, canvas]) {
+  el.addEventListener("touchstart", onTouchStart, { passive:false });
+  el.addEventListener("touchend", onTouchEnd, { passive:false });
+}
+
+/* PLAY works via BOTH click and touch, guarded against double-fire */
+function bindStart(el, fn) {
+  let fired = 0;
+  const go = e => {
+    const now = Date.now();
+    if (now - fired < 400) return;            // guard: touch then synthesised click
+    fired = now; e.preventDefault(); fn();
+  };
+  el.addEventListener("click", go);
+  el.addEventListener("touchend", go, { passive:false });
+}
+bindStart(document.getElementById("playBtn"), startGame);
+bindStart(document.getElementById("againBtn"), startGame);
+
+buildMaze(); pacman = makePacman(); setupGhosts(); updateHud();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
