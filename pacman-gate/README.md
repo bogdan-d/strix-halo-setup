@@ -68,3 +68,24 @@ control: if the judge ever fails it, the judge is wrong.
 ⚠ **One roll per model, temperature 1.0.** The same model and prompt produced
 0-reached and 4/14 an hour apart, so single-roll scores are close to coin flips.
 Treat any gap under ~4 checks as noise, and re-run before believing a ranking.
+
+## Addendum 2026-08-02: checks 18–22 — hand-testing keeps teaching the judge
+
+A build passed all 17 checks; twenty minutes of human play then found four
+defects the judge missed. Each became a check, calibrated the same way — the
+reference must pass, the offending build must fail:
+
+| # | Check | What human play caught |
+|---|---|---|
+| 18 | after power expiry NO ghost is edible (incl a respawned one) | ghost-state probe, all four ghosts, live-array reads |
+| 19 | pacman has a mouth (stationary sprite vs its own bounding disc, ratio < 0.90) | a mouthless full disc scored "PASS" on a motion-variance v1 — motion confounds; measure stationary |
+| 20 | ghosts have visible eyes | rounded-square blobs faked the v1 "skirt" test at their corners |
+| 21 | maze + HUD fit a 390×660 viewport | the file gets opened in messenger in-app browsers, not bare phones |
+| 22 | frightened ghosts blink their last 2 s (spec line) | an unblinking ghost looks normal while still edible — "I ate a normal ghost" |
+
+Also fixed: `check()` now coerces to bool — JS floats leaking through `ok`
+produced garbled summaries like `26.45/22`.
+
+The reference passes 22/22. The lesson generalises: **every automated gate is
+an approximation of a human with hands on the artifact; budget for the loop
+where play findings become checks.**

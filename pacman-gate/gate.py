@@ -8,6 +8,7 @@ import numpy as np
 FNAME = sys.argv[1] if len(sys.argv) > 1 else "pacman.html"
 results = []
 def check(name, ok, detail=""):
+    ok = bool(ok)                      # floats/objects leaked in and produced "26.45/22" summaries
     results.append(ok)
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail and not ok else ""))
 
@@ -208,6 +209,160 @@ with sync_playwright() as p:
     check("swap-through collision detected", bool(r10) and r10['dl']==-1, str(r10))
 
     # 13. zero page errors through everything above
+    # ---- checks 18-21: added 2026-08-02 from Zach's HAND-TESTING of a 17/17
+    # build. Every one is a defect the first 17 checks passed: a respawned ghost
+    # that stayed edible after power expired, a mouthless pacman disc, ghosts
+    # drawn as plain blobs, and the maze bottom cropped on a phone. The gate
+    # only learns what human play keeps teaching it.
+
+    # 18. post-expiry collision, ALL ghost states (incl eaten-and-respawned)
+    fresh_start()
+    r18 = pg.evaluate("""() => new Promise(res => {
+      for (let y=0;y<maze.length;y++) for (let x=0;x<maze[0].length;x++)
+        if (maze[y][x]===3) { pacman.prev={x,y}; pacman.x=x; pacman.y=y; y=1e9; break; }
+      const g0=ghosts[0];
+      g0.inHouse=false; g0.eaten=false; g0.frightened=true;
+      g0.x=pacman.x; g0.y=pacman.y; g0.prev={x:pacman.x,y:pacman.y};
+      powerMode=true; checkGhostCollisions();          // eat one during power
+      setTimeout(() => {
+        const out={eatWorked: score>=200, results:[]};
+        for (let i=0;i<4;i++) {
+          // re-read LIVE objects each round: a death may have rebuilt the
+          // ghosts array and pacman (that is correct game behaviour, and
+          // iterating a stale snapshot was a bug in this check's first draft).
+          gameState="playing"; lives=3;
+          const g=ghosts[i]; if (!g) continue;
+          g.inHouse=false; g.eaten=false; g.frightened=false;
+          g.x=pacman.x; g.y=pacman.y; g.prev={x:pacman.x,y:pacman.y};
+          const s0=score, l0=lives;
+          checkGhostCollisions();
+          out.results.push({ds:score-s0, dl:lives-l0});
+        }
+        res(out);
+      }, 11000);                                        // well past any 7s power window
+    })""")
+    bad18 = [r for r in (r18 or {}).get('results',[]) if r['ds'] >= 200 or r['dl'] >= 0]
+    check("after power expiry NO ghost is edible (incl respawned)", bool(r18) and not bad18,
+          f"{r18}")
+
+    # 19. pacman has a MOUTH (stationary sprite vs its own bounding disc).
+    # v1 measured pixel variance while moving — motion itself varies the count,
+    # so a mouthless disc passed. v2: freeze pacman, compare filled-pixel count
+    # to the area of the disc implied by the sprite's own bounding box. A wedge
+    # removes >=10% of the disc; anti-aliasing costs <5%.
+    fresh_start()
+    pg.wait_for_timeout(400)   # no input: pacman stationary
+    r19 = pg.evaluate("""() => {
+      const cv=document.querySelector('canvas');
+      const C=maze[0].length, R=maze.length;
+      const cw=cv.width/C, ch=cv.height/R;
+      const ctx=cv.getContext('2d');
+      const d=ctx.getImageData(Math.max(0,(pacman.x-0.6)*cw), Math.max(0,(pacman.y-0.6)*ch),
+                               Math.ceil(cw*2.2), Math.ceil(ch*2.2));
+      const px=d.data, W=d.width, H=d.height;
+      const tally={};
+      for (let y=0;y<H;y++) for (let x=0;x<W;x++) {
+        const i=(y*W+x)*4;
+        if (px[i]+px[i+1]+px[i+2] < 120) continue;
+        const k=(px[i]>>5)+"-"+(px[i+1]>>5)+"-"+(px[i+2]>>5);
+        (tally[k]=tally[k]||[]).push([x,y]);
+      }
+      let best=null, n=0;
+      for (const k in tally) if (tally[k].length>n) { n=tally[k].length; best=tally[k]; }
+      if (!best || n<25) return {n, ratio:1, note:"sprite not found"};
+      let x0=1e9,x1=-1,y0=1e9,y1=-1;
+      for (const [x,y] of best) { x0=Math.min(x0,x); x1=Math.max(x1,x); y0=Math.min(y0,y); y1=Math.max(y1,y); }
+      const r=Math.max(x1-x0, y1-y0)/2 + 0.5;
+      const disc=Math.PI*r*r;
+      return {n, ratio: n/disc};
+    }""")
+    check("pacman has a mouth (sprite is a wedge, not a full disc)",
+          bool(r19) and r19.get('ratio',1) < 0.90,
+          f"filled/disc ratio {r19.get('ratio',0):.2f} (full disc ~0.95+, wedge <0.90)")
+
+    # 20. ghosts are drawn as GHOSTS (eyes or scalloped skirt), not plain blobs
+    r20 = pg.evaluate("""() => {
+      const cv=document.querySelector('canvas');
+      const C=maze[0].length, R=maze.length;
+      const cw=cv.width/C, ch=cv.height/R;
+      const ctx=cv.getContext('2d');
+      let ghostly=0, seen=0;
+      for (const g of ghosts) {
+        if (g.inHouse) continue;
+        seen++;
+        const d=ctx.getImageData(Math.max(0,(g.x-0.5)*cw), Math.max(0,(g.y-0.5)*ch),
+                                 Math.ceil(cw*2), Math.ceil(ch*2));
+        const px=d.data, W=d.width, H=d.height;
+        let white=0; const bottoms={};
+        for (let y=0;y<H;y++) for (let x=0;x<W;x++) {
+          const i=(y*W+x)*4;
+          const r=px[i],gg=px[i+1],b=px[i+2];
+          if (r>200&&gg>200&&b>200) white++;
+          if (r+gg+b>150 && !(r>200&&gg>200&&b>200)) bottoms[x]=y;   // colored body lowest y
+        }
+        const ys=Object.values(bottoms);
+        const skirt = ys.length>4 && (Math.max(...ys)-Math.min(...ys)) >= 3;
+        if (white>=6) ghostly++;   // eyes MANDATORY: rounded-square blobs faked the skirt test (v1)
+      }
+      return {ghostly, seen};
+    }""")
+    check("ghosts look like ghosts (visible eyes on most)", bool(r20) and r20['seen']>0 and r20['ghostly'] >= max(1, r20['seen']-1),
+          f"{r20}")
+
+    # 21. phone fit: full maze + HUD visible in a 390x844 viewport, no crop
+    pg.set_viewport_size({"width":390, "height":660})   # telegram in-app browser reality, not a bare phone
+    pg.wait_for_timeout(500)
+    r21 = pg.evaluate("""() => {
+      const cv=document.querySelector('canvas');
+      const r=cv.getBoundingClientRect();
+      const hud=[...document.querySelectorAll('body *')].filter(e =>
+        /score|lives/i.test(e.textContent||'') && e.children.length===0)
+        .map(e=>e.getBoundingClientRect());
+      const hudOK = hud.length===0 ? true : hud.every(h => h.bottom <= innerHeight+2 && h.top >= -2);
+      return {cvTop:r.top, cvBottom:r.bottom, ih:innerHeight, cvOK: r.bottom <= innerHeight+2 && r.top >= -2, hudOK};
+    }""")
+    check("in-app browser viewport (390x660): maze + HUD fully visible, no crop",
+          bool(r21) and r21['cvOK'] and r21['hudOK'],
+          f"canvas {r21['cvTop']:.0f}..{r21['cvBottom']:.0f} vs viewport {r21['ih']}" if r21 else "no data")
+
+    # 22. SPEC: "Timer visibly runs out (blink last 2s)". Zach ate a
+    # normal-LOOKING ghost: without the blink, the last edible seconds are
+    # indistinguishable from normal. Sample a frightened ghost's dominant color
+    # late in power mode — it must alternate.
+    fresh_start()
+    pg.evaluate("""() => {
+      for (let y=0;y<maze.length;y++) for (let x=0;x<maze[0].length;x++)
+        if (maze[y][x]===3) { pacman.prev={x,y}; pacman.x=x; pacman.y=y; y=1e9; break; }
+      const g=ghosts[0];
+      g.inHouse=false; g.eaten=false;
+      g.x=Math.max(1,pacman.x-3); g.y=pacman.y; g.prev={x:g.x,y:g.y};
+    }""")
+    pg.keyboard.press("ArrowLeft"); pg.wait_for_timeout(300)
+    pg.wait_for_timeout(4700)     # into the last ~2s of a 7s window
+    cols=[]
+    for _ in range(10):
+        c = pg.evaluate("""() => {
+          const g=ghosts[0]; if (!g || g.inHouse || g.eaten) return null;
+          const cv=document.querySelector('canvas');
+          const C=maze[0].length, R=maze.length;
+          const cw=cv.width/C, ch=cv.height/R;
+          const d=cv.getContext('2d').getImageData(Math.max(0,(g.x-0.5)*cw), Math.max(0,(g.y-0.5)*ch),
+                                                   Math.ceil(cw*1.6), Math.ceil(ch*1.6)).data;
+          const t={};
+          for (let i=0;i<d.length;i+=4) {
+            if (d[i]+d[i+1]+d[i+2] < 120) continue;
+            const k=(d[i]>>5)+"-"+(d[i+1]>>5)+"-"+(d[i+2]>>5);
+            t[k]=(t[k]||0)+1;
+          }
+          let bk=null,bn=0; for (const k in t) if (t[k]>bn){bn=t[k];bk=k;}
+          return bk;
+        }""")
+        if c: cols.append(c)
+        pg.wait_for_timeout(150)
+    blink_ok = len(set(cols)) >= 2 and len(cols) >= 5
+    check("power-mode blink warning in the last 2s (spec line)", blink_ok,
+          f"dominant colors sampled: {sorted(set(cols))}")
+
     check("zero JS page errors end-to-end", len(errors)==0, "; ".join(errors[:3]))
     b.close()
 
