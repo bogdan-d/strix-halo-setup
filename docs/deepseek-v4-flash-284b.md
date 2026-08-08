@@ -196,12 +196,74 @@ per token will comfortably out-run a dense model with far fewer total parameters
 The local-model scene fixates on the first term. On this hardware, the second and third
 decide whether the thing is actually useful.
 
+## Speculative decoding (DSpark): it works, but buys no speedup here
+
+DeepSeek ships a **DSpark** block-parallel drafter for V4-Flash — it drafts a whole block
+of tokens in one pass, the full model verifies them, and the accepted prefix is kept. On
+an NVIDIA DGX Spark it is reported at roughly 1.9x generation speed. The question for this
+box: does it carry to the Vulkan/RDNA path?
+
+**It runs and accepts tokens — and the wall-clock does not move.** Measured 2026-08-08.
+
+### Build
+
+Mainline llama.cpp reads V4-Flash natively (`src/models/deepseek4.cpp`) **and** carries
+the DSpark speculative path. There are two distinct spec types in
+`common/speculative.cpp` — `draft-dflash` and `draft-dspark` — and DSpark needs
+`draft-dspark`. Passing `draft-dflash` silently leaves `speculative: false` in `/slots`;
+that wrong flag is the single biggest trap.
+
+```bash
+# mainline llama.cpp, commit 69bf643 (2026-08-08), Vulkan:
+cmake -B build -G Ninja -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+GGML_VK_PREFER_HOST_MEMORY=ON llama-server \
+  -m DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf \
+  -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 5 \
+  -ngl 99 -fa 1 -c 32768 --load-mode mmap --jinja
+```
+
+The draft must come from the **same quant family** as the target. Pairing the Unsloth
+`UD-IQ2_XXS` target with an antirez-requantised draft gave **0.15%** acceptance — the two
+distributions did not match. Unsloth's own `dspark-…-Q8_0.gguf` (10.1 GiB) against the
+Unsloth target is the pairing that works. Confirm with `/slots`: `speculative: true`.
+
+### Measured (gfx1151, Vulkan, Unsloth UD-IQ2_XXS target + Unsloth dspark-Q8_0 draft)
+
+| config | draft acceptance | tg t/s |
+|---|---|---|
+| plain, no spec | — | ~9.5 |
+| `draft-dspark --spec-draft-n-max 3` | 61.8% (mean 2.85 tok/draft) | 9.5 |
+| `draft-dspark --spec-draft-n-max 5` | 46.3% (mean 3.31 tok/draft) | 9.6 |
+
+Acceptance is genuinely high, and throughput does not change. The draft's own forward pass
+plus the verify step cost about what the accepted tokens save, at every block setting.
+
+### Why — and why this is *not* "Vulkan can't do speculative decoding"
+
+The same box runs **Qwen3-35B-A3B with `--spec-type draft-mtp` at ~78 t/s**, where
+speculative decoding pays off cleanly. The difference is the **draft's weight**: an MTP
+head is essentially one extra layer, near-free to run; DSpark's draft is a full ~10 GiB
+model, so its per-step cost is comparable to the target's on a bandwidth-limited iGPU. DGX
+Spark's ~1.9x comes from CUDA's optimised speculative kernels and tensor cores making that
+heavy draft and the batched verify nearly free; the Vulkan/RDNA path has no equivalent, so
+the overhead cancels the acceptance gain. The acceptance and the flat throughput are
+measured; the CUDA-vs-Vulkan explanation is the best-supported hypothesis, not a profiled
+fact.
+
+So DSpark here is a correctness success and a speed no-op: V4-Flash stays ~8–10 t/s with
+or without it. For real speedup on Strix Halo, the lever is a small-MoE model carrying a
+cheap MTP draft, not a heavyweight standalone drafter.
+
 ## Verdict
 
 Worth running if you want a frontier-scale model that never leaves your machine and you
 can work at ~12 t/s: hard analysis, overnight batch work, second opinions on things you
 would not send to a cloud API. Not worth running as a daily coding driver, where a
-well-preserved smaller model wins decisively.
+well-preserved smaller model wins decisively. Speculative decoding (DSpark) does not change
+this — it works but yields no speedup on the Vulkan path, as above.
 
 Either way, a 284B model at full 131k context on a mini PC iGPU is a genuinely different
 2026 than most people assume.
