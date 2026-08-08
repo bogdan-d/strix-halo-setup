@@ -346,6 +346,20 @@ iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856
 - `amdgpu.gttsize=126976` — GTT window of 124GiB (126976 MiB) so the iGPU can address nearly all system RAM
 - `ttm.pages_limit=32505856` — pinned-pages cap matching the GTT window (32505856 × 4KiB = 124GiB)
 
+> **⚠ The TTM cap can be silently clamped — verify it at runtime, not just on the cmdline.**
+> Setting `ttm.pages_limit=32505856` on the kernel cmdline is necessary but *not always sufficient*: on some boots the live value is clamped back toward the ~96GiB default, so `cat /sys/module/ttm/parameters/pages_limit` reads far below what the cmdline asked for. When that happens, any model whose weights exceed ~90GiB (e.g. the 90.9GiB DeepSeek-V4-Flash mixed q2/q4/q8 quants) fails to load or thrashes — even though the cmdline looks correct. The symptom is a "needs a smaller base model / exceeds the box" style failure that disappears once the live cap is actually raised.
+>
+> Fix: enforce it at runtime and persist it with a tiny boot service.
+> ```bash
+> cat /sys/module/ttm/parameters/pages_limit          # check the LIVE value first (pages)
+> echo 32505856 | sudo tee /sys/module/ttm/parameters/pages_limit   # 32505856 x 4KiB = 124GiB
+> # persist across reboots — see systemd/ttm-pages-limit.service
+> sudo cp systemd/ttm-pages-limit.service /etc/systemd/system/
+> sudo systemctl enable --now ttm-pages-limit.service
+> cat /sys/module/ttm/parameters/pages_limit          # must now read 32505856
+> ```
+> The service only writes one sysfs number, depends on nothing, and no-ops on failure, so it can never delay or block boot.
+
 Pairs with the BIOS: **VGM/UMA set to the 1GB minimum**, NOT a big dedicated carve. The GPU then allocates from GTT on demand — RAM stays flexible between CPU and GPU instead of being hard-partitioned at boot. (An earlier revision of this setup used a 96GB VGM carve, which left Linux only ~31GB of system RAM; that approach is retired and this README previously described it.)
 
 Set via `grubby` or `/etc/default/grub`.

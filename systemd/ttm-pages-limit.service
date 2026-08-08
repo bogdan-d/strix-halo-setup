@@ -1,0 +1,18 @@
+[Unit]
+Description=Raise TTM GPU memory ceiling to 124 GiB for large local LLM quants (Strix Halo)
+# Deliberately depends on NOTHING and is a dependency of NOTHING critical, so a
+# failure here can never delay or block boot. It only writes one sysfs number.
+# Needed because the `ttm.pages_limit=` kernel cmdline value is sometimes clamped
+# back toward the ~96 GiB default at boot; this re-asserts the 124 GiB ceiling so
+# weights over ~90 GiB (e.g. the 90.9 GiB DeepSeek-V4-Flash mixed quants) load.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 32505856 pages x 4096 = 124.0 GiB, matching amdgpu.gttsize=126976 (124 GiB).
+# The `|| true` makes a missing path or a rejected write a silent no-op: the unit
+# can never fail, cascade, or hang boot.
+ExecStart=/bin/sh -c 'echo 32505856 > /sys/module/ttm/parameters/pages_limit 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
