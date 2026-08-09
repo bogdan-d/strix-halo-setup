@@ -50,6 +50,9 @@ All GPU services run as **systemd user services** with auto-start on boot.
 | Mesa | 25.3.6 (Vulkan 1.4.341) | Vulkan RADV driver |
 | llama.cpp | fresh upstream `~/llama.cpp` @ `fb30ba9` (Vulkan build) | Native MTP speculative decoding (`--spec-type draft-mtp`). The old `~/llama-cpp-turboquant` fork is retired for the LLM path. |
 | ROCm | 7.2 (kyuz0 toolbox) | For VLM + ComfyUI containers |
+
+> **Vulkan users:** pin the *date-stamped* kyuz0 tag. A later build on the floating
+> tag cost 2.3x on token generation here. See [docs/vulkan-pinned-build.md](docs/vulkan-pinned-build.md).
 | XRT | 2.23.0 | NPU runtime, built from `~/xdna-driver` |
 | amdxdna | 2.23.0 (DKMS) | NPU kernel module |
 | FastFlowLM | v0.9.36 | NPU inference server |
