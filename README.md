@@ -144,6 +144,8 @@ Qwen3.6-27B-AWQ-INT4. This is the workload llama.cpp with `--parallel 1` does no
 **111 t/s aggregate across 32 concurrent users** (19.6x scaling over single-stream), on one
 desktop-class box. Full writeup: [`docs/vllm-gfx1151.md`](docs/vllm-gfx1151.md).
 
+**Muse-Glimmer-30B (vision, 30B):** ~26.5 t/s on a custom ROCm-FP4 build; FP4-on-ROCm beats Q4_K-on-Vulkan (bandwidth-bound). Full writeup: [`docs/muse-glimmer-30b-strix.md`](docs/muse-glimmer-30b-strix.md).
+
 ```bash
 bin/vllm-serve-strix.sh                 # defaults: AWQ 27B, :8107, eager, max_num_seqs 256
 MEM_FRAC=0.5 PORT=8107 bin/vllm-serve-strix.sh /path/to/hf-model
