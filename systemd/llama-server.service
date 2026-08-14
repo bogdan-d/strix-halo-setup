@@ -5,12 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Keep the desktop responsive while serving: deprioritize vs interactive work.
+Nice=10
+CPUWeight=40
 Environment=GGML_VK_PREFER_HOST_MEMORY=ON
+# Notes on the tuning (2026-08-14):
+#  - 131072 ctx, not the model's 256k max: 256k over-reserved KV and contributed
+#    to desktop freezes; 128k covers the real workload.
+#  - --spec-draft-n-max 2 for this MoE + this build (re-measured; was 3).
+#  - --reasoning off: thinking is opt-IN per request via
+#    chat_template_kwargs {"enable_thinking": true} — see README.
 ExecStart=%h/llama.cpp/build/bin/llama-server \
   -m %h/models/qwen3.6-mtp/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
   --spec-type draft-mtp \
-  --spec-draft-n-max 3 \
-  --ctx-size 262144 \
+  --spec-draft-n-max 2 \
+  --ctx-size 131072 \
+  --parallel 1 \
   --port 8001 \
   --host 0.0.0.0 \
   --no-warmup \
@@ -19,10 +29,12 @@ ExecStart=%h/llama.cpp/build/bin/llama-server \
   --jinja \
   --ubatch-size 1024 \
   -fa 1 \
+  --poll 100 \
+  -t 16 \
   -ctk q8_0 \
   -ctv q8_0 \
   --cache-prompt \
-  --reasoning-budget 4096 \
+  --reasoning off \
   --reasoning-format auto
 Restart=on-failure
 RestartSec=10

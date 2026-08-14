@@ -1,0 +1,42 @@
+[Unit]
+Description=llama-server (Vulkan - Strix Halo - Qwen3.8-27B VL + native MTP, :8022)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Nice=10
+CPUWeight=40
+Environment=GGML_VK_PREFER_HOST_MEMORY=ON
+ExecStart=%h/llama.cpp/build/bin/llama-server \
+  -m %h/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --mmproj %h/models/qwen3.8-27b/mmproj-F16.gguf \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 2 \
+  --ctx-size 262144 \
+  --parallel 2 \
+  --port 8022 \
+  --host 0.0.0.0 \
+  --no-warmup \
+  -ngl 99 \
+  --mmap \
+  --jinja \
+  -fa 1 \
+  -t 16 \
+  -ctk q8_0 \
+  -ctv q8_0 \
+  --cache-prompt \
+  --reasoning off \
+  --reasoning-format auto \
+  --temp 0.7 \
+  --top-p 0.80 \
+  --top-k 20 \
+  --min-p 0 \
+  --presence-penalty 1.5
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

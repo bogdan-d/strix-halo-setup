@@ -1,33 +1,34 @@
 # Strix Halo Local AI Setup
 
-Local LLM/VLM + image/video generation + NPU inference for AMD Strix Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU, XDNA2 NPU) with 128GB unified LPDDR5X (124GiB visible to Linux; the iGPU addresses nearly all of it via GTT).
+Local LLM/VLM + image/video generation + NPU inference for AMD Strix Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU, XDNA2 NPU) with 128GB unified LPDDR5X (124GiB visible to Linux; the iGPU addresses up to 108GiB of it via GTT — capped on purpose, see boot parameters).
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  GPU (Vulkan RADV + ROCm toolboxes — ~124GiB unified via GTT)   │
+│  GPU (Vulkan RADV + ROCm toolboxes — GTT capped at 108GiB)      │
 │  ├─ llama-server (Vulkan, llama.cpp)     port 8001               │
-│  │  └─ Qwen3.6-35B-A3B MTP (UD-Q4_K_XL, 256k ctx, primary)      │
-│  │     Gemma 4 26B-A4B is the switchable alternate (see below)  │
+│  │  └─ Qwen3.6-35B-A3B MTP (UD-Q4_K_XL, primary; 256k-capable,  │
+│  │     run at 128k ctx). Switchable: Qwen3.6-27B / Gemma / DS4  │
+│  ├─ llama-server-qwen38 (Vulkan)        port 8022               │
+│  │  └─ Qwen3.8-27B VL + native MTP (UD-Q4_K_XL + mmproj-F16)    │
+│  │     second resident: vision + writing. Replaced Muse-Glimmer │
 │  ├─ ComfyUI (ROCm toolbox)             port 7860               │
 │  │  └─ Image/video gen (Wan 2.2, HunyuanVideo, Qwen Image)     │
-│  ├─ llama-vlm-bom (ROCm toolbox)       port 8080               │
+│  ├─ llama-vlm-bom (ROCm toolbox)       port 8080 (on-demand)   │
 │  │  └─ Qwen3-VL-32B (vision/BOM extraction)                    │
-│  ├─ llama-surya2 (ROCm toolbox)        port 8093               │
-│  │  └─ Surya 2 OCR VLM 650M (document OCR, prod)                │
-│  ├─ surya-server (podman, dedicated)   port 8090               │
-│  │  └─ Surya v1 layout+OCR (legacy path)                       │
-│  └─ llama-server-qwen36 (Vulkan)       port 8092 (disabled)    │
-│     └─ Qwen3.6-27B Q4 + mmproj (single-pass DO extract)        │
+│  ├─ llama-surya2 (ROCm toolbox)        port 8093 (on-demand)   │
+│  │  └─ Surya 2 OCR VLM 650M (document OCR)                      │
+│  └─ surya-server (podman, dedicated)   port 8090 (legacy)      │
+│     └─ Surya v1 layout+OCR                                      │
 │                                                                  │
 │  NPU (XDNA2 — 51 TOPS, 47μs latency)                           │
-│  └─ FastFlowLM RUNNING (flm-asr.service) port 52625            │
+│  └─ FastFlowLM (flm-asr.service)        port 52625 (on-demand)  │
 │     └─ Whisper STT for Jarvis (off CPU) + small LLMs           │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-All GPU services run as **systemd user services** with auto-start on boot.
+All GPU services run as **systemd user services**; the two resident LLM servers (:8001, :8022) and ComfyUI auto-start on boot, the rest start on demand.
 
 ## Hardware
 
@@ -39,16 +40,16 @@ All GPU services run as **systemd user services** with auto-start on boot.
 | VRAM | BIOS VGM carve: **1GB** (deliberate — GPU allocates from GTT instead) |
 | NPU | XDNA2 aie2p 6x8 (PCI c7:00.1, 1022:17f0 rev 11) |
 | RAM | 128GB LPDDR5X-8000 physical; **124GiB visible to Linux** |
-| GTT | ~124GiB GPU-addressable (`amdgpu.gttsize=126976`, `ttm.pages_limit=32505856`) |
+| GTT | 124GiB window, pinned pages capped at **108GiB** (`amdgpu.gttsize=126976`, `ttm.pages_limit=28311552`) — see [Kernel boot parameters](#kernel-boot-parameters) |
 | BIOS | AMI v1.07 |
 
 ## Software stack
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| Kernel | 7.1.0-rc7 (vanilla) | COPR `@kernel-vanilla/mainline-wo-mergew` |
+| Kernel | 7.2.0-rc3 (vanilla) | COPR `@kernel-vanilla/mainline-wo-mergew` |
 | Mesa | 25.3.6 (Vulkan 1.4.341) | Vulkan RADV driver |
-| llama.cpp | fresh upstream `~/llama.cpp` @ `fb30ba9` (Vulkan build) | Native MTP speculative decoding (`--spec-type draft-mtp`). The old `~/llama-cpp-turboquant` fork is retired for the LLM path. |
+| llama.cpp | fresh upstream `~/llama.cpp` @ `69bf643` (2026-08-08, Vulkan build) | Native MTP speculative decoding (`--spec-type draft-mtp`). The old `~/llama-cpp-turboquant` fork is retired for the LLM path. |
 | ROCm | 7.2 (kyuz0 toolbox) | For VLM + ComfyUI containers |
 
 > **Vulkan users:** pin the *date-stamped* kyuz0 tag. A later build on the floating
@@ -119,22 +120,43 @@ Claude Code CLI ──► claude-code-router (ccr, :3456) ──► llama-server
 - **ccr config:** [`configs/claude-code-router.config.json`](configs/claude-code-router.config.json)
   (lives at `~/.claude-code-router/config.json`; `ccr restart` after edits).
 
-### Switching the :8001 model (Qwen3.6 ⇄ Gemma)
+### Switching the :8001 model
 
 `:8001` runs one model at a time as a systemd user service. Flip between them with
 [`bin/strix-llm-switch.sh`](bin/strix-llm-switch.sh):
 
 ```bash
-~/bin/strix-llm-switch.sh qwen    # → Qwen3.6 MTP  (llama-server.service, the default)
+~/bin/strix-llm-switch.sh qwen    # → Qwen3.6-35B-A3B MTP (llama-server.service, the default)
+~/bin/strix-llm-switch.sh qwen27  # → Qwen3.6-27B dense (llama-server-qwen27b.service)
 ~/bin/strix-llm-switch.sh gemma   # → Gemma 4 26B-A4B (llama-server-gemma.service)
+~/bin/strix-llm-switch.sh ds4     # → DeepSeek-V4-Flash 284B (llama-server-ds4.service)
 ```
 
 It writes `~/.config/strix-llm-unit` as the single source of truth so a liveness watchdog
-revives the *currently-selected* unit instead of fighting the swap. Qwen3.6 is hybrid-thinking:
-apps that hit `:8001` directly with a **small `max_tokens`** must send
-`chat_template_kwargs: {"enable_thinking": false}` or the reasoning eats the budget and
-`content` comes back empty — Claude Code sends large budgets, so it's unaffected. Audit
-small-budget callers before swapping Gemma → Qwen3.6.
+revives the *currently-selected* unit instead of fighting the swap.
+
+**Thinking is now OFF at the server (2026-08-14).** The unit runs `--reasoning off`, so
+Qwen3.6's hybrid thinking is opt-**in** per request with
+`chat_template_kwargs: {"enable_thinking": true}`. This inverts the earlier setup, where
+thinking was on by default and every small-`max_tokens` caller had to remember to send
+`enable_thinking: false` or reasoning silently ate the budget and `content` came back
+empty — off-by-default turned a recurring caller-side foot-gun into an explicit opt-in.
+
+### The second resident — Qwen3.8-27B VL on :8022 (and the Glimmer story)
+
+Since 2026-08-08 the box keeps a **second model resident** alongside the :8001 primary,
+for vision + writing work (the 35B-A3B is text-only). Two models held that seat:
+
+- **Muse-Glimmer-30B** (2026-08-08 → 08-14): vision 30B on a custom **ROCm-FP4** build,
+  ~26.5 t/s — FP4-on-ROCm beats Q4_K-on-Vulkan on this bandwidth-bound part. Full
+  writeup: [`docs/muse-glimmer-30b-strix.md`](docs/muse-glimmer-30b-strix.md). The unit
+  (`llama-server-glimmer-fpx`) is disabled but kept on disk as a rollback.
+- **Qwen3.8-27B** (2026-08-14 →, current): native **vision (mmproj) + native MTP** in one
+  model, unsloth UD-Q4_K_XL + mmproj-F16, served by the same upstream llama.cpp Vulkan
+  build as :8001 — one stack instead of a bespoke FP4 build. ~22 t/s tg with **61% MTP
+  draft acceptance**, 256k ctx, `--parallel 2`. Recommended sampling (temp 0.7, top-p 0.8,
+  top-k 20, presence 1.5) is baked into the unit, reasoning off by default.
+  Unit: [`systemd/llama-server-qwen38.service`](systemd/llama-server-qwen38.service).
 
 ## vLLM on gfx1151 — many-user serving
 
@@ -181,6 +203,7 @@ generation, warm), i.e. actual end-user throughput including the jinja chat temp
 |-------|-------------|:-:|:-:|:-:|------|
 | **Qwen3.6-35B-A3B** (3B active) | UD-Q4_K_XL, MTP n=3, q8_0 KV | **~66-78 t/s** | 86 | 44-80% | **PRIMARY :8001 driver** (`strix-llm-switch qwen`) — MoE, proven agent driver, 256k ctx. ~66 on general text, up to ~78 on code (higher accept) |
 | Qwen3.6-27B (DENSE, 27B active) | UD-Q4_K_XL, MTP n=5, q8_0 KV | **~20-22 t/s** | 25 | 30-58% | experimental *alternate* (not default): dense, vision, stronger coder, 256k ctx. MTP only ~1.7x here (dense) |
+| **Qwen3.8-27B VL** (DENSE, 27B active) | UD-Q4_K_XL + mmproj-F16, MTP n=2, q8_0 KV | **~22 t/s** | — | ~61% | **SECOND RESIDENT :8022** — native vision + native MTP in one model; the box's vision/writing driver since 2026-08-14 |
 | **Gemma-4-26B-A4B** (4B active) | UD-Q4_K_XL, MTP n=3, f16 KV | **~78 t/s** | 82 | 66-71% | switchable: vision-capable, strong extraction/structured-output |
 
 **Optimal MTP settings (tuned 2026-07-14):**
@@ -315,11 +338,13 @@ Kernel 7.0 significantly improves prompt processing via RADV/Vulkan improvements
 | Service | Port | Backend | Startup | Description |
 |---------|------|---------|---------|-------------|
 | `llama-server` | 8001 | Vulkan | auto | **Primary LLM — Qwen3.6-35B-A3B MTP** (fresh upstream llama.cpp, Vulkan RADV) |
-| `llama-server-gemma` | 8001 | Vulkan | via switch | Alternate LLM — Gemma 4 26B-A4B. Bind-conflicts with `llama-server`; use `strix-llm-switch.sh` to flip |
+| `llama-server-qwen38` | 8022 | Vulkan | auto | **Second resident — Qwen3.8-27B VL + MTP** (vision + writing; replaced Muse-Glimmer 2026-08-14) |
+| `llama-server-qwen27b` | 8001 | Vulkan | via switch | Alternate — Qwen3.6-27B dense. Bind-conflicts with `llama-server`; flip with `strix-llm-switch.sh qwen27` |
+| `llama-server-gemma` | 8001 | Vulkan | via switch | Alternate — Gemma 4 26B-A4B. Bind-conflicts with `llama-server`; flip with `strix-llm-switch.sh gemma` |
 | `comfyui` | 7860 | ROCm | auto | Image/video gen (kyuz0 toolbox container) |
-| `llama-vlm-bom` | 8080 | ROCm | auto | Vision LLM (Qwen3-VL-32B, kyuz0 ROCm 7.2 toolbox) |
-| `llama-surya2` | 8093 | ROCm | auto | Surya 2 OCR VLM 650M (document OCR, prod) |
-| `flm-asr` | 52625 | NPU | **running** (`flm-asr.service`) | Whisper STT for the Jarvis voice assistant (offloaded from CPU) + small LLMs |
+| `llama-vlm-bom` | 8080 | ROCm | on-demand | Vision LLM (Qwen3-VL-32B, kyuz0 ROCm 7.2 toolbox) — started when a vision batch needs it |
+| `llama-surya2` | 8093 | ROCm | on-demand | Surya 2 OCR VLM 650M (document OCR) |
+| `flm-asr` | 52625 | NPU | on-demand | Whisper STT for the Jarvis voice assistant (offloaded from CPU) + small LLMs |
 | `lemonade` | 8000 | Vulkan | manual | Web UI + sd-cpp (optional) |
 
 ### Managing services
@@ -341,27 +366,35 @@ curl http://localhost:8001/health
 
 ## Kernel boot parameters
 
-Required for optimal Strix Halo unified memory performance:
+Required for optimal Strix Halo unified memory performance (current since 2026-08-09):
 
 ```
-iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856
+amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=28311552
 ```
 
-- `iommu=pt` — reduces overhead for iGPU unified memory access
+- `amd_iommu=off` — replaces the earlier `iommu=pt`. Benchmarked on Strix Halo as **5-12%
+  faster than either IOMMU-enabled mode** (Lars Urban's numbers in kyuz0's toolboxes repo,
+  issue #66); fine on a box that needs no VFIO/SR-IOV passthrough
 - `amdgpu.gttsize=126976` — GTT window of 124GiB (126976 MiB) so the iGPU can address nearly all system RAM
-- `ttm.pages_limit=32505856` — pinned-pages cap matching the GTT window (32505856 × 4KiB = 124GiB)
+- `ttm.pages_limit=28311552` — pinned-pages cap of **108GiB** (28311552 × 4KiB), deliberately
+  ~16GiB *below* the GTT window. An earlier revision matched the cap to the window (124GiB ==
+  all of RAM); that let GPU allocations starve the host — a second model load OOM-killed the
+  whole desktop with "nothing killable" (2026-08-08) because every large process was pinned.
+  Capping TTM at 108GiB keeps a floor of host-reclaimable RAM no model load can take.
 
 > **⚠ The TTM cap can be silently clamped — verify it at runtime, not just on the cmdline.**
-> Setting `ttm.pages_limit=32505856` on the kernel cmdline is necessary but *not always sufficient*: on some boots the live value is clamped back toward the ~96GiB default, so `cat /sys/module/ttm/parameters/pages_limit` reads far below what the cmdline asked for. When that happens, any model whose weights exceed ~90GiB (e.g. the 90.9GiB DeepSeek-V4-Flash mixed q2/q4/q8 quants) fails to load or thrashes — even though the cmdline looks correct. The symptom is a "needs a smaller base model / exceeds the box" style failure that disappears once the live cap is actually raised.
+> Setting `ttm.pages_limit=` on the kernel cmdline is necessary but *not always sufficient*: on some boots the live value is clamped back toward the ~96GiB default, so `cat /sys/module/ttm/parameters/pages_limit` reads something other than what the cmdline asked for. When that happens, any model whose weights exceed the live cap (e.g. the 90.9GiB DeepSeek-V4-Flash mixed q2/q4/q8 quants) fails to load or thrashes — even though the cmdline looks correct. The symptom is a "needs a smaller base model / exceeds the box" style failure that disappears once the live cap is actually applied.
 >
-> Fix: enforce it at runtime and persist it with a tiny boot service.
+> Fix: enforce it at runtime and persist it with a tiny boot service. **The service must
+> write the SAME value as the cmdline** — a service still carrying an old value silently
+> re-widens (or re-narrows) the cap on every boot.
 > ```bash
 > cat /sys/module/ttm/parameters/pages_limit          # check the LIVE value first (pages)
-> echo 32505856 | sudo tee /sys/module/ttm/parameters/pages_limit   # 32505856 x 4KiB = 124GiB
+> echo 28311552 | sudo tee /sys/module/ttm/parameters/pages_limit   # 28311552 x 4KiB = 108GiB
 > # persist across reboots — see systemd/ttm-pages-limit.service
 > sudo cp systemd/ttm-pages-limit.service /etc/systemd/system/
 > sudo systemctl enable --now ttm-pages-limit.service
-> cat /sys/module/ttm/parameters/pages_limit          # must now read 32505856
+> cat /sys/module/ttm/parameters/pages_limit          # must now read 28311552
 > ```
 > The service only writes one sysfs number, depends on nothing, and no-ops on failure, so it can never delay or block boot.
 
@@ -448,7 +481,7 @@ The NPU (XDNA2, ~50 TOPS INT8) is best for small always-on models, freeing the G
 
 | Use Case | Tool | Status |
 |----------|------|--------|
-| **Voice assistant STT (Jarvis)** | FastFlowLM `whisper-v3:turbo` (`flm-asr.service`) | **LIVE — ~6x realtime, off the CPU** |
+| **Voice assistant STT (Jarvis)** | FastFlowLM `whisper-v3:turbo` (`flm-asr.service`) | Working — ~6x realtime, off the CPU (service on-demand) |
 | Small LLM (1-4B) | FastFlowLM (`flm serve <model>`) | 28-89 tok/s |
 | Embeddings | `embed-gemma:300m` via flm | Low latency |
 
@@ -502,7 +535,8 @@ FP8 is a **software limitation** on Strix Halo (RDNA 3.5). Always use BF16 model
 
 | Model | Type | Active Params | Quant | Speed | Use case |
 |-------|------|---------------|-------|-------|----------|
-| **Qwen3.6-35B-A3B MTP** | MoE | 3B | UD-Q4_K_XL | **~75–86 t/s gen** (native MTP), 256k ctx | **Default (2026-07-10+)** — Claude Code / coding, fast decode via `--spec-type draft-mtp` |
+| **Qwen3.6-35B-A3B MTP** | MoE | 3B | UD-Q4_K_XL | **~75–86 t/s gen** (native MTP), 256k-capable (run at 128k) | **Default (2026-07-10+)** — Claude Code / coding, fast decode via `--spec-type draft-mtp` |
+| **Qwen3.8-27B VL** (:8022, second resident) | Dense | 27B | UD-Q4_K_XL + mmproj-F16 | **~22 t/s gen** (native MTP, 61% accept), 256k ctx | **Vision + writing (2026-08-14+)** — replaced Muse-Glimmer-30B on :8022 |
 | Gemma 4 26B-A4B-it | MoE | 4B | UD-Q4_K_XL + MTP | **~78 t/s gen** (draft-mtp n=3, f16 KV peak 82), 128k ctx | Switchable alternate: vision, extraction quality, structured output, tool use |
 | Qwen3.6-35B-A3B (Q8, no MTP) | MoE | 3B | UD-Q8_K_XL | ~44 t/s gen, ~839 t/s pp | Prior primary — higher-fidelity quant without MTP |
 | Qwen3.5-122B-A10B | MoE | 10B | UD-Q4_K_XL | ~22 t/s gen, ~393 t/s pp | Legacy, SOTA quality but slower |
@@ -558,9 +592,12 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 ├── setup.sh                              # Main setup script
 ├── systemd/
 │   ├── llama-server.service              # PRIMARY LLM — Qwen3.6-35B-A3B MTP (Vulkan, auto)
+│   ├── llama-server-qwen38.service       # SECOND RESIDENT — Qwen3.8-27B VL + MTP on :8022 (auto)
+│   ├── llama-server-qwen27b.service      # Alternate LLM — Qwen3.6-27B dense (via switch)
 │   ├── llama-server-gemma.service        # Alternate LLM — Gemma 4 26B-A4B (via switch)
-│   ├── llama-vlm-bom.service             # Vision LLM (Qwen3-VL-32B, ROCm toolbox, auto)
-│   ├── llama-surya2.service              # Surya 2 OCR VLM (document OCR, ROCm, auto)
+│   ├── llama-vlm-bom.service             # Vision LLM (Qwen3-VL-32B, ROCm toolbox, on-demand)
+│   ├── llama-surya2.service              # Surya 2 OCR VLM (document OCR, ROCm, on-demand)
+│   ├── ttm-pages-limit.service           # Enforce the 108GiB TTM cap at boot
 │   ├── comfyui.service                   # ComfyUI (ROCm toolbox, auto-enabled)
 │   └── lemonade.service                  # Lemonade router (optional, disabled by default)
 ├── bin/
@@ -574,9 +611,12 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 │   ├── claude-code-local-qwen3.6-mtp.md  # Claude Code on local Qwen3.6 (full writeup)
 │   ├── comfyui-qwen-image.md             # Qwen-Image GGUF workflow notes
 │   ├── deepseek-v4-flash-284b.md         # DeepSeek V4 Flash 284B: Vulkan config, numbers, traps
+│   ├── diffusion-lora-training-gfx1151.md # Image gen (sd.cpp Vulkan) + LoRA training on gfx1151
+│   ├── muse-glimmer-30b-strix.md         # Muse-Glimmer-30B: FP4-ROCm vs Q4-Vulkan A/B
 │   ├── strix-guard.md                    # Remote kill-switch / stack guard
 │   ├── unsloth-rocm-gfx1151.md           # Fine-tuning: Unsloth on ROCm, multimodal LoRA, GGUF
-│   └── vllm-gfx1151.md                   # vLLM on gfx1151: what blocks it, measured throughput
+│   ├── vllm-gfx1151.md                   # vLLM on gfx1151: what blocks it, measured throughput
+│   └── vulkan-pinned-build.md            # Why the kyuz0 Vulkan tag must be date-pinned
 ├── tools/
 │   └── cc-qwen-vs-opus.sh                # Head-to-head test harness (local Qwen3.6 vs Opus)
 ├── workflows/
@@ -592,6 +632,10 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 
 | Component | Version | Date | Notes |
 |-----------|---------|------|-------|
+| Qwen3.8-27B VL on :8022 | unsloth UD-Q4_K_XL + mmproj-F16 | 2026-08-14 | Native VL + native MTP in one model; replaced Muse-Glimmer as the second resident |
+| Kernel + boot params | 7.2.0-rc3 vanilla; `amd_iommu=off`, TTM cap 108GiB | 2026-08-09 | IOMMU off (5-12% on this platform); TTM capped below GTT so the GPU can't starve the host |
+| Muse-Glimmer-30B on :8022 | custom ROCm-FP4 build | 2026-08-08 | Second resident (vision), ~26.5 t/s; retired 08-14, unit kept as rollback |
+| llama.cpp | fresh upstream `~/llama.cpp` @ 69bf643 (Vulkan) | 2026-08-08 | Current build for :8001 and :8022 |
 | llama.cpp | fresh upstream `~/llama.cpp` @ fb30ba9 (Vulkan) | 2026-07-10 | Native MTP (`--spec-type draft-mtp`), Qwen3.6 primary, ~75–86 t/s tg |
 | Qwen3.6-35B-A3B MTP model | unsloth UD-Q4_K_XL (~22.85 GB) | 2026-07-10 | MTP layers grafted into GGUF; 256k ctx |
 | llama.cpp | 8793 (Vulkan build from turboquant fork) | 2026-04-03 | 393 t/s pp, 22 t/s tg |
