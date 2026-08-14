@@ -48,7 +48,7 @@ All GPU services run as **systemd user services**; the two resident LLM servers 
 | Kernel | 7.2.0-rc3 (vanilla) | COPR `@kernel-vanilla/mainline-wo-mergew` |
 | Mesa | 25.3.6 (Vulkan 1.4.341) | Vulkan RADV driver |
 | llama.cpp | fresh upstream `~/llama.cpp` @ `69bf643` (2026-08-08, Vulkan build) | Native MTP speculative decoding (`--spec-type draft-mtp`). The old `~/llama-cpp-turboquant` fork is retired for the LLM path. |
-| ROCm | 7.2 (kyuz0 toolbox) | For VLM + ComfyUI containers |
+| ROCm | 7.2 (kyuz0 toolbox) | For Surya OCR + ComfyUI containers |
 
 > **Vulkan users:** pin the *date-stamped* kyuz0 tag. A later build on the floating
 > tag cost 2.3x on token generation here. See [docs/vulkan-pinned-build.md](docs/vulkan-pinned-build.md).
@@ -403,7 +403,7 @@ Set via `grubby` or `/etc/default/grub`.
 
 | Container | Image | Status | Purpose |
 |-----------|-------|--------|---------|
-| `llama-rocm-7.2` | `kyuz0/amd-strix-halo-toolboxes:rocm-7.2` | running | ROCm LLM inference (VLM) |
+| `llama-rocm-7.2` | `kyuz0/amd-strix-halo-toolboxes:rocm-7.2` | running | ROCm inference (Surya 2 OCR; formerly the VLM) |
 | `strix-halo-comfyui` | `kyuz0/amd-strix-halo-comfyui:latest` | running | ComfyUI image/video gen |
 | `strix-halo-image-video` | `kyuz0/amd-strix-halo-image-video:latest` | available | Qwen Image Studio + Wan 2.2 |
 | `llama-vulkan-radv` | `kyuz0/amd-strix-halo-toolboxes:vulkan-radv` | available | Vulkan LLM (backup) |
