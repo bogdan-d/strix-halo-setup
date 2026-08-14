@@ -15,8 +15,6 @@ Local LLM/VLM + image/video generation + NPU inference for AMD Strix Halo APU (R
 │  │     second resident: vision + writing. Replaced Muse-Glimmer │
 │  ├─ ComfyUI (ROCm toolbox)             port 7860               │
 │  │  └─ Image/video gen (Wan 2.2, HunyuanVideo, Qwen Image)     │
-│  ├─ llama-vlm-bom (ROCm toolbox)       port 8080 (on-demand)   │
-│  │  └─ Qwen3-VL-32B (vision/BOM extraction)                    │
 │  ├─ llama-surya2 (ROCm toolbox)        port 8093 (on-demand)   │
 │  │  └─ Surya 2 OCR VLM 650M (document OCR)                      │
 │  └─ surya-server (podman, dedicated)   port 8090 (legacy)      │
@@ -342,7 +340,6 @@ Kernel 7.0 significantly improves prompt processing via RADV/Vulkan improvements
 | `llama-server-qwen27b` | 8001 | Vulkan | via switch | Alternate — Qwen3.6-27B dense. Bind-conflicts with `llama-server`; flip with `strix-llm-switch.sh qwen27` |
 | `llama-server-gemma` | 8001 | Vulkan | via switch | Alternate — Gemma 4 26B-A4B. Bind-conflicts with `llama-server`; flip with `strix-llm-switch.sh gemma` |
 | `comfyui` | 7860 | ROCm | auto | Image/video gen (kyuz0 toolbox container) |
-| `llama-vlm-bom` | 8080 | ROCm | on-demand | Vision LLM (Qwen3-VL-32B, kyuz0 ROCm 7.2 toolbox) — started when a vision batch needs it |
 | `llama-surya2` | 8093 | ROCm | on-demand | Surya 2 OCR VLM 650M (document OCR) |
 | `flm-asr` | 52625 | NPU | on-demand | Whisper STT for the Jarvis voice assistant (offloaded from CPU) + small LLMs |
 | `lemonade` | 8000 | Vulkan | manual | Web UI + sd-cpp (optional) |
@@ -351,7 +348,7 @@ Kernel 7.0 significantly improves prompt processing via RADV/Vulkan improvements
 
 ```bash
 # Status
-systemctl --user status llama-server comfyui llama-vlm-bom
+systemctl --user status llama-server llama-server-qwen38 comfyui
 
 # Start/stop
 systemctl --user start llama-server
@@ -548,11 +545,12 @@ To flip the live `:8001` model between the Qwen3.6 MTP default and Gemma:
 To change quant/path, edit the `-m` line in the relevant unit (`llama-server.service` for
 Qwen3.6, `llama-server-gemma.service` for Gemma) and `systemctl --user restart` it.
 
-### VLM (llama-vlm-bom on port 8080)
+### VLM — retired standalone service (2026-08-15)
 
-| Model | Type | Params | Backend | Use case |
-|-------|------|--------|---------|----------|
-| Qwen3-VL-32B | Dense | 32B | ROCm 7.2 | Vision, BOM extraction |
+The dedicated Qwen3-VL-32B server (`llama-vlm-bom`, :8080, ROCm toolbox) is **retired**:
+the always-on Qwen3.8-27B VL on :8022 handles vision now — one resident model instead of
+a windowed 32B that had to be started for every vision batch. Every former :8080 consumer
+points at :8022. Surya 2 (:8093) remains the dedicated document-OCR path.
 
 ### Image/Video Generation (ComfyUI on port 7860)
 
@@ -595,7 +593,6 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 │   ├── llama-server-qwen38.service       # SECOND RESIDENT — Qwen3.8-27B VL + MTP on :8022 (auto)
 │   ├── llama-server-qwen27b.service      # Alternate LLM — Qwen3.6-27B dense (via switch)
 │   ├── llama-server-gemma.service        # Alternate LLM — Gemma 4 26B-A4B (via switch)
-│   ├── llama-vlm-bom.service             # Vision LLM (Qwen3-VL-32B, ROCm toolbox, on-demand)
 │   ├── llama-surya2.service              # Surya 2 OCR VLM (document OCR, ROCm, on-demand)
 │   ├── ttm-pages-limit.service           # Enforce the 108GiB TTM cap at boot
 │   ├── comfyui.service                   # ComfyUI (ROCm toolbox, auto-enabled)
