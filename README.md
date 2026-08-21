@@ -1,6 +1,6 @@
 # Strix Halo Local AI Setup
 
-Local LLM/VLM + image/video generation + NPU inference for AMD Strix Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU, XDNA2 NPU) with 128GB unified LPDDR5X (124GiB visible to Linux; the iGPU addresses up to 108GiB of it via GTT — capped on purpose, see boot parameters).
+Local LLM/VLM + image/video generation (+ NPU inference, currently disabled by `amd_iommu=off`, see [Kernel boot parameters](#kernel-boot-parameters)) for AMD Strix Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU, XDNA2 NPU) with 128GB unified LPDDR5X (124GiB visible to Linux; the iGPU addresses up to 108GiB of it via GTT — capped on purpose, see boot parameters).
 
 ## Architecture
 
@@ -133,6 +133,13 @@ Claude Code CLI ──► claude-code-router (ccr, :3456) ──► llama-server
 It writes `~/.config/strix-llm-unit` as the single source of truth so a liveness watchdog
 revives the *currently-selected* unit instead of fighting the swap.
 
+> **Maintenance gotcha (2026-08-21).** That watchdog is a systemd timer (every 5 min). A
+> bare `systemctl --user stop llama-server` is undone within 2-5 minutes, and a model you
+> are loading by hand on :8001 loses the port race. For a maintenance window stop the
+> watchdog timer first (`systemctl --user stop lyra-stack-watchdog.timer`), then the unit,
+> and start both again afterwards. A runtime mask (`systemctl --user mask --runtime`) does
+> **not** help: `~/.config/systemd/user` outranks `$XDG_RUNTIME_DIR/systemd/user`.
+
 **Thinking is now OFF at the server (2026-08-14).** The unit runs `--reasoning off`, so
 Qwen3.6's hybrid thinking is opt-**in** per request with
 `chat_template_kwargs: {"enable_thinking": true}`. This inverts the earlier setup, where
@@ -152,9 +159,20 @@ for vision + writing work (the 35B-A3B is text-only). Two models held that seat:
 - **Qwen3.8-27B** (2026-08-14 →, current): native **vision (mmproj) + native MTP** in one
   model, unsloth UD-Q4_K_XL + mmproj-F16, served by the same upstream llama.cpp Vulkan
   build as :8001 — one stack instead of a bespoke FP4 build. ~22 t/s tg with **61% MTP
-  draft acceptance**, 256k ctx, `--parallel 2`. Recommended sampling (temp 0.7, top-p 0.8,
-  top-k 20, presence 1.5) is baked into the unit, reasoning off by default.
-  Unit: [`systemd/llama-server-qwen38.service`](systemd/llama-server-qwen38.service).
+  draft acceptance**. Recommended sampling (temp 0.7, top-p 0.8, top-k 20, presence 1.5,
+  reasoning off) is what the unit in this repo ships:
+  [`systemd/llama-server-qwen38.service`](systemd/llama-server-qwen38.service).
+
+  > **Drift notice (2026-08-21).** The live unit on the box was re-tuned on 2026-08-20
+  > ("swapped from Q8_0 for decode speed") and now runs ctx 131072, `--parallel 1`,
+  > `--reasoning-effort low --reasoning-budget 8192` (thinking **on** by default),
+  > temp 0.3 / top-p 0.95 / presence 0 — while its own header comment and this repo
+  > still say "reasoning off, presence 1.5". Measured consequence: a short structured
+  > read (a stamp crop, 160-token answer budget) came back **empty** in 12.7 s with
+  > thinking on, and correct in 7.2 s with `chat_template_kwargs: {"enable_thinking": false}`.
+  > Until the two are reconciled, callers that want a short answer must send
+  > `enable_thinking: false` (+ `reasoning_budget: 0`); callers that want thinking get it
+  > by default. Reconcile by choosing one recipe and updating both the unit and this file.
 
 ## vLLM on gfx1151 — many-user serving
 
@@ -202,7 +220,7 @@ generation, warm), i.e. actual end-user throughput including the jinja chat temp
 | **Qwen3.6-35B-A3B** (3B active) | UD-Q4_K_XL, MTP n=3, q8_0 KV | **~66-78 t/s** | 86 | 44-80% | **PRIMARY :8001 driver** (`strix-llm-switch qwen`) — MoE, proven agent driver, 256k ctx. ~66 on general text, up to ~78 on code (higher accept) |
 | Qwen3.6-27B (DENSE, 27B active) | UD-Q4_K_XL, MTP n=5, q8_0 KV | **~20-22 t/s** | 25 | 30-58% | experimental *alternate* (not default): dense, vision, stronger coder, 256k ctx. MTP only ~1.7x here (dense) |
 | **Qwen3.8-27B VL** (DENSE, 27B active) | UD-Q4_K_XL + mmproj-F16, MTP n=2, q8_0 KV | **~22 t/s** | — | ~61% | **SECOND RESIDENT :8022** — native vision + native MTP in one model; the box's vision/writing driver since 2026-08-14 |
-| **Gemma-4-26B-A4B** (4B active) | UD-Q4_K_XL, MTP n=3, f16 KV | **~78 t/s** | 82 | 66-71% | switchable: vision-capable, strong extraction/structured-output |
+| **Gemma-4-26B-A4B** (4B active) | UD-Q4_K_XL, MTP n=3, f16 KV | **~78 t/s** | 82 | 66-71% | switchable: text-only as configured (no `--mmproj` in the unit; the mmproj-F16 is in the HF cache if vision is wanted), strong extraction/structured-output. MTP needs the sidecar: `-md mtp-gemma-4-26B-A4B-it.gguf --spec-type draft-mtp`, otherwise llama-server exits with "context type MTP requested but model doesn't contain MTP layers". |
 
 **Optimal MTP settings (tuned 2026-07-14):**
 
@@ -341,8 +359,8 @@ Kernel 7.0 significantly improves prompt processing via RADV/Vulkan improvements
 | `llama-server-gemma` | 8001 | Vulkan | via switch | Alternate — Gemma 4 26B-A4B. Bind-conflicts with `llama-server`; flip with `strix-llm-switch.sh gemma` |
 | `comfyui` | 7860 | ROCm | auto | Image/video gen (kyuz0 toolbox container) |
 | `llama-surya2` | 8093 | ROCm | on-demand | Surya 2 OCR VLM 650M (document OCR) |
-| `flm-asr` | 52625 | NPU | on-demand | Whisper STT for the Jarvis voice assistant (offloaded from CPU) + small LLMs |
-| `lemonade` | 8000 | Vulkan | manual | Web UI + sd-cpp (optional) |
+| `flm-asr` | 52625 | NPU | **disabled** | Whisper STT on the NPU for the voice assistant + small LLMs. Unavailable since 2026-08-09: `amd_iommu=off` leaves `amdxdna` unable to initialise ("IOMMU is off, require carveout memory", no `/dev/accel`). STT falls back to CPU/GPU whisper. |
+| `lemonade-server` (snap) | 13305 | Vulkan | manual | Lemonade 11.7.0 (`lemond`, 2026-08-21): OpenAI-compatible server + model manager + sd-cpp. Not in the serving path; the v11.6 TheNoise ROCm image backend is experimental and unused here (image gen = sd.cpp Vulkan). |
 
 ### Managing services
 
@@ -372,6 +390,10 @@ amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=28311552
 - `amd_iommu=off` — replaces the earlier `iommu=pt`. Benchmarked on Strix Halo as **5-12%
   faster than either IOMMU-enabled mode** (Lars Urban's numbers in kyuz0's toolboxes repo,
   issue #66); fine on a box that needs no VFIO/SR-IOV passthrough
+  **Side effect: the XDNA2 NPU is disabled on this boot config.** `amdxdna` logs
+  "IOMMU is off, require carveout memory" and fails init (-19); `/dev/accel` never
+  appears, so FastFlowLM / `flm-asr` cannot run. Re-enable the IOMMU (`iommu=pt`) to get
+  the NPU back, at the cost of the Vulkan gain above. (Observed 2026-08-21.)
 - `amdgpu.gttsize=126976` — GTT window of 124GiB (126976 MiB) so the iGPU can address nearly all system RAM
 - `ttm.pages_limit=28311552` — pinned-pages cap of **108GiB** (28311552 × 4KiB), deliberately
   ~16GiB *below* the GTT window. An earlier revision matched the cap to the window (124GiB ==
