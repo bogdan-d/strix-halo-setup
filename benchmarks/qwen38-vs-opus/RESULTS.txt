@@ -1,0 +1,26 @@
+SCORECARD (pass-rate by bucket, generated 2026-08-22 22:26 SGT)
+
+
+                   opus:claude-opus-4-8 qwen:qwen3.8-27b-think
+D-function                          3/3                    3/3
+B-fixbug                            3/3                    3/3
+C-feature                           2/2                    2/2
+A-build                             2/2                    2/2
+--------------------------------------------------------------
+opus:claude-opus-4-8: 10/10 passed | avg fix-rounds 0.0 | avg 29s/task
+qwen:qwen3.8-27b-think: 10/10 passed | avg fix-rounds 0.0 | avg 320s/task
+
+QUALITY / ROBUSTNESS (harder hidden edge cases; loc = qwen/opus)
+
+
+task                 loc q/o  robust q  robust o   detail
+d1_roman               12/20      PASS      PASS   
+d2_merge               11/13      PASS      PASS   
+d3_lru                 16/16      PASS      PASS   
+b1_offbyone            11/11      PASS      PASS   
+b2_blankcanvas         10/11         -         -   n/a
+b3_crashempty            3/7      PASS      PASS   
+c1_search                8/8      PASS      PASS   
+c2_paginate              8/5      PASS      PASS   
+a1_todo              182/226      PASS      PASS   
+a2_snake             126/189      PASS      PASS   

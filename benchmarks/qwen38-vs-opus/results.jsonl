@@ -1,0 +1,20 @@
+{"task": "d1_roman", "bucket": "D-function", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 20, "why": ""}
+{"task": "d2_merge", "bucket": "D-function", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 22, "why": ""}
+{"task": "d3_lru", "bucket": "D-function", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 22, "why": ""}
+{"task": "b1_offbyone", "bucket": "B-fixbug", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 20, "why": ""}
+{"task": "b2_blankcanvas", "bucket": "B-fixbug", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 33, "why": ""}
+{"task": "b3_crashempty", "bucket": "B-fixbug", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 47, "why": ""}
+{"task": "c1_search", "bucket": "C-feature", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 19, "why": ""}
+{"task": "c2_paginate", "bucket": "C-feature", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 19, "why": ""}
+{"task": "a1_todo", "bucket": "A-build", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 42, "why": ""}
+{"task": "a2_snake", "bucket": "A-build", "model": "opus:claude-opus-4-8", "passed": true, "fix_rounds": 0, "secs": 46, "why": ""}
+{"task": "d1_roman", "bucket": "D-function", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 264.9, "why": ""}
+{"task": "d2_merge", "bucket": "D-function", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 261.7, "why": ""}
+{"task": "d3_lru", "bucket": "D-function", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 275.0, "why": ""}
+{"task": "b1_offbyone", "bucket": "B-fixbug", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 424.0, "why": ""}
+{"task": "b2_blankcanvas", "bucket": "B-fixbug", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 280.7, "why": "index.html: rendered, no JS errors"}
+{"task": "b3_crashempty", "bucket": "B-fixbug", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 328.3, "why": ""}
+{"task": "c1_search", "bucket": "C-feature", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 309.0, "why": ""}
+{"task": "c2_paginate", "bucket": "C-feature", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 328.2, "why": ""}
+{"task": "a1_todo", "bucket": "A-build", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 371.6, "why": ""}
+{"task": "a2_snake", "bucket": "A-build", "model": "qwen:qwen3.8-27b-think", "passed": true, "fix_rounds": 0, "secs": 358.4, "why": ""}

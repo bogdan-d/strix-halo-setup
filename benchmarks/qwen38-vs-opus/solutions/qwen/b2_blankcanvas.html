@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0}canvas{display:block}</style></head><body><canvas id=c width=640 height=420></canvas><script>
+const cv=document.getElementById('c');const ctx=cv.getContext('2d');
+const state={x:100,y:100};
+function draw(){
+  ctx.fillStyle='#0a1020';ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.fillStyle='#e33';ctx.fillRect(state.x, state.y, 60, 60);
+  requestAnimationFrame(draw);
+}
+draw();
+</script></body></html>

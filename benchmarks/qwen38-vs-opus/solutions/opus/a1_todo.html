@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>To-Do</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --ink: #1f2933;
+    --muted: #7b8794;
+    --accent: #0d9488;
+    --danger: #e11d48;
+    --line: #e4e7eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  .app {
+    width: 100%;
+    max-width: 520px;
+    background: var(--card);
+    border-radius: 14px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+    padding: 28px;
+  }
+  h1 {
+    margin: 0 0 20px;
+    font-size: 24px;
+    font-weight: 700;
+  }
+  .entry {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 18px;
+  }
+  #task-input {
+    flex: 1;
+    padding: 12px 14px;
+    font-size: 15px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    outline: none;
+  }
+  #task-input:focus { border-color: var(--accent); }
+  #add-btn {
+    padding: 12px 18px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    background: var(--accent);
+    border: none;
+    border-radius: 9px;
+    cursor: pointer;
+  }
+  #add-btn:hover { background: #0b8177; }
+  ul#list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  li.item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 4px;
+    border-bottom: 1px solid var(--line);
+  }
+  li.item:last-child { border-bottom: none; }
+  li.item input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    flex-shrink: 0;
+    accent-color: var(--accent);
+  }
+  li.item .text {
+    flex: 1;
+    font-size: 15px;
+    word-break: break-word;
+  }
+  li.item.done .text {
+    text-decoration: line-through;
+    color: var(--muted);
+  }
+  li.item .del {
+    background: none;
+    border: none;
+    color: var(--danger);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    flex-shrink: 0;
+  }
+  li.item .del:hover { background: rgba(225,29,72,0.1); }
+  .empty {
+    color: var(--muted);
+    font-size: 14px;
+    text-align: center;
+    padding: 24px 0;
+  }
+</style>
+</head>
+<body>
+  <main class="app">
+    <h1>To-Do</h1>
+    <form class="entry" id="entry-form">
+      <input type="text" id="task-input" placeholder="What needs doing?" autocomplete="off" aria-label="New task">
+      <button type="submit" id="add-btn">Add</button>
+    </form>
+    <ul id="list"></ul>
+    <p class="empty" id="empty-msg">No tasks yet. Add one above.</p>
+  </main>
+
+<script>
+(function () {
+  "use strict";
+
+  var STORAGE_KEY = "todo.items.v1";
+  var listEl = document.getElementById("list");
+  var emptyEl = document.getElementById("empty-msg");
+  var formEl = document.getElementById("entry-form");
+  var inputEl = document.getElementById("task-input");
+
+  var items = load();
+
+  function load() {
+    try {
+      var raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      var parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(function (it) {
+        return it && typeof it.text === "string" && typeof it.id !== "undefined";
+      });
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function save() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
+    } catch (e) {
+      /* storage unavailable or full; keep app usable in memory */
+    }
+  }
+
+  function makeId() {
+    return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+  }
+
+  function render() {
+    listEl.textContent = "";
+    if (items.length === 0) {
+      emptyEl.style.display = "block";
+      return;
+    }
+    emptyEl.style.display = "none";
+
+    items.forEach(function (item) {
+      var li = document.createElement("li");
+      li.className = "item" + (item.done ? " done" : "");
+      li.setAttribute("data-id", item.id);
+
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !!item.done;
+      cb.setAttribute("aria-label", "Mark done");
+      cb.addEventListener("change", function () {
+        toggle(item.id);
+      });
+
+      var span = document.createElement("span");
+      span.className = "text";
+      span.textContent = item.text;
+
+      var del = document.createElement("button");
+      del.type = "button";
+      del.className = "del";
+      del.setAttribute("aria-label", "Delete task");
+      del.textContent = "×";
+      del.addEventListener("click", function () {
+        remove(item.id);
+      });
+
+      li.appendChild(cb);
+      li.appendChild(span);
+      li.appendChild(del);
+      listEl.appendChild(li);
+    });
+  }
+
+  function add(text) {
+    var trimmed = text.trim();
+    if (!trimmed) return;
+    items.push({ id: makeId(), text: trimmed, done: false });
+    save();
+    render();
+  }
+
+  function toggle(id) {
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].id === id) {
+        items[i].done = !items[i].done;
+        break;
+      }
+    }
+    save();
+    render();
+  }
+
+  function remove(id) {
+    items = items.filter(function (it) {
+      return it.id !== id;
+    });
+    save();
+    render();
+  }
+
+  formEl.addEventListener("submit", function (e) {
+    e.preventDefault();
+    add(inputEl.value);
+    inputEl.value = "";
+    inputEl.focus();
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
