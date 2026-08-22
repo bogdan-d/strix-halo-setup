@@ -157,11 +157,18 @@ for vision + writing work (the 35B-A3B is text-only). Two models held that seat:
   writeup: [`docs/muse-glimmer-30b-strix.md`](docs/muse-glimmer-30b-strix.md). The unit
   (`llama-server-glimmer-fpx`) is disabled but kept on disk as a rollback.
 - **Qwen3.8-27B** (2026-08-14 →, current): native **vision (mmproj) + native MTP** in one
-  model, unsloth UD-Q4_K_XL + mmproj-F16, served by the same upstream llama.cpp Vulkan
-  build as :8001 — one stack instead of a bespoke FP4 build. ~22 t/s tg with **61% MTP
-  draft acceptance**. Recommended sampling (temp 0.7, top-p 0.8, top-k 20, presence 1.5,
-  reasoning off) is what the unit in this repo ships:
-  [`systemd/llama-server-qwen38.service`](systemd/llama-server-qwen38.service).
+  model + mmproj-F16, served by the same upstream llama.cpp Vulkan build as :8001 — one
+  stack instead of a bespoke FP4 build. Two quant points, pick per workload:
+  - **Q8_0** (current, 2026-08-22): highest quality, **~17 t/s** tg (MTP), ctx 131072.
+    Q8 weights are ~29 GB so the KV has to give context back (131072, not 262144).
+  - **UD-Q4_K_XL**: **~22-25 t/s** tg with **61% MTP draft acceptance**, fits ctx 262144.
+    ~40% smaller weights → ~1.4x faster decode, at some quality cost.
+
+  Recommended sampling (temp 0.7, top-p 0.8, top-k 20, presence 1.5, reasoning off) is what
+  the unit in this repo ships:
+  [`systemd/llama-server-qwen38.service`](systemd/llama-server-qwen38.service). See
+  **[Decode-speed ceiling for dense 27B Q8](#decode-speed-ceiling-for-dense-27b-q8-on-gfx1151)**
+  for why ~17 t/s is the proven wall and what actually moves it.
 
   > **Drift notice (2026-08-21).** The live unit on the box was re-tuned on 2026-08-20
   > ("swapped from Q8_0 for decode speed") and now runs ctx 131072, `--parallel 1`,
@@ -173,6 +180,47 @@ for vision + writing work (the 35B-A3B is text-only). Two models held that seat:
   > Until the two are reconciled, callers that want a short answer must send
   > `enable_thinking: false` (+ `reasoning_budget: 0`); callers that want thinking get it
   > by default. Reconcile by choosing one recipe and updating both the unit and this file.
+  >
+  > **Resolved 2026-08-22.** Swapped **back to Q8_0** (standard full-precision-8-bit model,
+  > not a special variant) for coding/quality, ctx 131072. Thinking stays per-request
+  > (default on; short-answer callers send `enable_thinking: false`). Q8 measured ~17 t/s vs
+  > Q4 ~25 t/s on this box — see below for why that gap is bandwidth, not tuning.
+
+### Decode-speed ceiling for dense 27B Q8 on gfx1151
+
+**~17 t/s is the proven fastest a dense ~27B model at Q8 will decode on Strix Halo — with
+the standard full model, on the optimal backend, with speculation already on.** This is a
+memory-bandwidth wall, not a tuning problem. Decode reads every weight once per token, so
+the ceiling is `bandwidth ÷ model_size`. gfx1151 realizes ~215-256 GB/s; a 27B at Q8 is
+~29 GB:
+
+| what | decode t/s | notes |
+|---|---|---|
+| dense 27B Q8, **no** speculation | **~7.5** | the bandwidth floor, `256/29 ≈ 8.8`, `215/29 ≈ 7.4` |
+| dense 27B Q8, **+ MTP** (this box) | **~17** | speculation ≈ doubles the floor; MTP earning its keep |
+| dense 27B **Q4** + MTP | ~22-25 | ~40% smaller weights = ~1.4x, at quality cost |
+
+Proven in the wild (dense 27B/Q8 class, general output — not structured/repetition):
+
+- 7.4-7.6 t/s, dense 27B Q8_0, ROCm, no speculation — "the real Q8_0 ceiling for a 27B on
+  gfx1151, bound by weight-streaming bandwidth": https://github.com/hec-ovi/llama-qwen
+- Vulkan **beats** ROCm on decode by ~25% on this chip (97.7 vs 73.6 t/s on a 30B Q4), so
+  Vulkan is already the right backend for tg:
+  https://www.soothill.io/blog/2026/08/03/llamacpp-vulkan-vs-rocm-strix-halo/
+- The eye-catching "148+ t/s" figures floating around are **disclaimed by their own authors**
+  as a repetition/warm-cache artifact — not real chat decode.
+
+Nobody has published **>20 t/s of general dense-27B-Q8 decode** on this platform; every
+>20 number is Q4/FP4, structured output, or an artifact. The only real levers:
+
+1. **Q8 → Q6_K** (~22 GB): ~+25-30% → roughly 21-22 t/s, small quality cost. Cheapest honest
+   gain while staying dense.
+2. **Switch to a 30B-A3B-class MoE** — reads only ~3B active params/token, so it decodes
+   **3-6x faster** (66-100 t/s at Q4:
+   https://forum.level1techs.com/t/strix-halo-ryzen-ai-max-395-llm-benchmark-results/233796 ,
+   gpt-oss-20b Q8 MoE ~70 t/s: https://fromthematrix.dev/posts/local-llm-speed-benchmark-strix-halo/ ).
+   This box already runs a 35B-A3B MoE on :8001 for exactly this reason. Dense Q8 buys
+   quality; MoE buys speed — they are different tools.
 
 ## vLLM on gfx1151 — many-user serving
 
