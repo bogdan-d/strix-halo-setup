@@ -536,6 +536,22 @@ ComfyUI also requires `--disable-mmap --cache-none --bf16-vae` for the same reas
 
 FP8 is a **software limitation** on Strix Halo (RDNA 3.5). Always use BF16 models for image/video generation.
 
+### GPU queue-resets are normal on gfx1151 — and the kernel/firmware update posture
+
+Under sustained GL/compute load the amdgpu driver periodically logs `ring gfx_0.0.0 timeout` → `GPU reset begin` → **MODE2 reset succeeded** and carries on. A daily-health count like "queue-resets (recovered): N, critical faults: 1" over 24h is expected on this platform, **not a failing GPU** — the resets recover cleanly with no reboot. Confirm it's benign with `journalctl -k | grep -i "GPU reset\|ring.*timeout"`: if every reset is followed by "recovered through reset", the box is fine. A genuine hard hang on this box has been memory pressure (a second large model / oversized image render exceeding the TTM floor), not a GPU fault — see the TTM cap note above.
+
+This platform trait drives the update posture:
+
+- **Kernel / firmware / microcode are held by default** and only bumped for a *measured* win. The Build history shows the pattern: kernel 6.19.9 → 7.1-rc4 was taken because it gave +12-37% prompt speed. A bump that only "looks newer" is not worth it, because every such update is a **reboot**, and a reboot here also forces the **amdxdna DKMS rebuild** (`~/fix-dkms-xrt.sh`) and risks the black-screen-on-boot / mutter-sees-0-monitors issue.
+- **A firmware bump will not fix the resets.** Field evidence on gfx1151: the latest MES firmware still hangs on the compute wave store/resume path ([ROCm #5590](https://github.com/ROCm/ROCm/issues/5590), the documented workaround is a kernel flag, not a firmware version); newer kernels bring "improvements *and* regressions" on the Ryzen AI Max 395 ([Phoronix](https://www.phoronix.com/news/Linux-6.17-Early-Testing)); and one Framework Desktop owner's BIOS 3.0.4/3.0.5 update *introduced* hangs and had to be rolled back ([Framework community #82310](https://community.frame.work/t/strix-halo-gfx1151-gfx-ring-timeout-under-mundane-gl-load/82310)).
+- **The reset-reduction lever is a boot flag, not an update.** No amdgpu mitigation flag is set on this box: `gpu_recovery` runs at the default `-1` (auto, i.e. clean recovery already on — that's why resets recover), and `cwsr_enable` is at the default `1`. Setting `amdgpu.cwsr_enable=0` is the community workaround for the MES-firmware hang class, but it disables compute wave save/restore (can hurt ROCm/VLM preemption) and is still reboot-gated. Treat it as a *measured experiment* to bundle into the next kernel/firmware reboot window, not a reactive fix.
+
+Safe userspace updates (no reboot, model services untouched) are separate and fine to apply — exclude the held set:
+
+```bash
+sudo dnf upgrade --refresh --exclude="kernel*,*rocm*,*hip*,roc*,rccl*,mivisionx*,libdrm*,xorg-x11-server-Xwayland,mesa*,*-firmware,microcode*,hipcc,rocminfo"
+```
+
 ## Why Vulkan for LLM? Why ROCm for image gen?
 
 **LLM inference**: ROCm doesn't reliably detect gfx1151 for all workloads. Vulkan via RADV works perfectly and uses the full unified pool (~124GiB GTT).
