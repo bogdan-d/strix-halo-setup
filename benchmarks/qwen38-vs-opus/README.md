@@ -38,6 +38,32 @@ The tie says something real **and** has a real limit:
   and long-horizon debugging, which is where a frontier model is still expected to pull
   ahead. Those need harder suites (Aider polyglot, SWE-bench) to measure.
 
+## What the harder published benchmarks say
+
+Since this pilot's tasks were too easy to separate the two models, here is the gap on
+**published, third-party coding benchmarks** — the harder, agentic, less-contaminated suites
+this pilot could not. These are **vendor/author-reported numbers, not measured on this box**;
+they exist to size the gap that the pilot above deliberately does not.
+
+| benchmark | Claude Opus 4.8 | Qwen3.8-27B | source / caveat |
+|---|---|---|---|
+| SWE-bench Pro | 69.2% | 61.7% | Opus system card §8.1 / Qwen HF model card |
+| Terminal-Bench 2.1 | 74.6% | 73.0% | ⚠ Qwen figure self-reported (HF `verified: false`); harness may differ |
+
+No single board carries a clean head-to-head beyond those two. One-sided points, for context:
+
+- **LiveCodeBench v6:** Qwen 90.3% (Opus not listed on that board).
+- **SWE-bench Verified:** Opus 88.6% (no comparable Qwen entry).
+- **Aider polyglot:** neither model has a current entry (leaderboard stale since Oct 2025).
+
+**Read:** on the two hard agentic benches that *do* pit them head-to-head, the local 27B lands
+**within single digits** of a frontier model — near-frontier for coding, not a tier below. Two
+honest discounts apply to the Qwen column: the published number is the **full-precision** model,
+while this box serves **Q8** (likely ~1–2 pts lower from quantization), and the Terminal-Bench
+figure is self-reported rather than independently verified. The direction is unchanged — a local,
+private, on-box 27B is a single-digit gap behind Opus 4.8 on real agentic coding, at ~11× the
+wall-clock.
+
 ## Method
 
 - **Execution-graded.** Each task has a deterministic grader that runs the solution
