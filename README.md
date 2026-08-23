@@ -185,6 +185,15 @@ for vision + writing work (the 35B-A3B is text-only). Two models held that seat:
   > not a special variant) for coding/quality, ctx 131072. Thinking stays per-request
   > (default on; short-answer callers send `enable_thinking: false`). Q8 measured ~17 t/s vs
   > Q4 ~25 t/s on this box — see below for why that gap is bandwidth, not tuning.
+  >
+  > **Confirmed live 2026-08-23** (read straight from the server's `/slots`): the resident
+  > unit serves `Qwen3.8-27B-Q8_0.gguf` at **temp 0.3, top-k 20, top-p 0.95, presence 0,
+  > speculation (MTP) on, thinking on**, ctx 131072. So the *quant* drift is resolved, but the
+  > *sampling* drift is **not**: the box still runs temp 0.3 / presence 0, while the shipped
+  > unit and the "recommended sampling" line above still say temp 0.7 / presence 1.5. Pick one
+  > — edit `systemd/llama-server-qwen38.service` to match the box, or retune the box to the
+  > unit — and update this line when you do. (This is a coding endpoint now; temp 0.3 is the
+  > sane default for that, so the likely fix is to make the unit say 0.3 / 0.)
 
 ### Decode-speed ceiling for dense 27B Q8 on gfx1151
 
