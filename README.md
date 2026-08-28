@@ -2,6 +2,28 @@
 
 Local LLM/VLM + image/video generation (+ NPU inference, currently disabled by `amd_iommu=off`, see [Kernel boot parameters](#kernel-boot-parameters)) for AMD Strix Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU, XDNA2 NPU) with 128GB unified LPDDR5X (124GiB visible to Linux; the iGPU addresses up to 108GiB of it via GTT — capped on purpose, see boot parameters).
 
+## Contents
+
+- [Architecture](#architecture)
+- [Hardware](#hardware)
+- [Software stack](#software-stack)
+- [Quick start](#quick-start)
+- [DeepSeek V4 Flash (284B) — frontier-scale, fully local](#deepseek-v4-flash-284b--frontier-scale-fully-local)
+- [Claude Code on local Qwen3.6 (offline, 256k, MTP)](#claude-code-on-local-qwen36-offline-256k-mtp)
+- [vLLM on gfx1151 — many-user serving](#vllm-on-gfx1151--many-user-serving)
+- [Performance benchmarks](#performance-benchmarks)
+- [Services](#services)
+- [Kernel boot parameters](#kernel-boot-parameters)
+- [Containers (toolboxes)](#containers-toolboxes)
+- [NPU Setup](#npu-setup)
+- [Critical configuration notes](#critical-configuration-notes)
+- [Why Vulkan for LLM? Why ROCm for image gen?](#why-vulkan-for-llm-why-rocm-for-image-gen)
+- [Models](#models)
+- [Building llama.cpp (Vulkan)](#building-llamacpp-vulkan)
+- [Structure](#structure)
+- [Build history](#build-history)
+- [Troubleshooting](#troubleshooting)
+
 ## Architecture
 
 ```
@@ -42,6 +64,7 @@ All GPU services run as **systemd user services**; the two resident LLM servers 
 | BIOS | AMI v1.07 |
 
 ## Software stack
+_Latest content date: 2026-08-08_
 
 | Component | Version | Notes |
 |-----------|---------|-------|
@@ -79,6 +102,7 @@ generation at 12.3 t/s. Patch series + apply instructions:
 [`patches/vulkan-dsv4-kernels/`](patches/vulkan-dsv4-kernels/).
 
 ## DeepSeek V4 Flash (284B) — frontier-scale, fully local
+_Latest content date: 2026-08-01_
 
 A **284B-parameter model at full 131k context** on this box, GPU-offloaded via Vulkan,
 no CUDA. 130 t/s prompt, 12 t/s generation, ~5% decay to 4k depth. Measured 2026-08-01.
@@ -93,6 +117,7 @@ llama-server -m DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf \
 ```
 
 ## Claude Code on local Qwen3.6 (offline, 256k, MTP)
+_Latest content date: 2026-08-23_
 
 Run the **Claude Code CLI against the local Qwen3.6-35B-A3B** model — fully offline,
 zero API cost, 256k context — for real coding on large codebases. Built + verified
@@ -150,7 +175,7 @@ empty — off-by-default turned a recurring caller-side foot-gun into an explici
 ### The second resident — Qwen3.8-27B VL on :8022 (and the Glimmer story)
 
 Since 2026-08-08 the box keeps a **second model resident** alongside the :8001 primary,
-for vision + writing work (the 35B-A3B is text-only). Two models held that seat:
+for vision + writing work (our 35B-A3B unit runs text-only, no mmproj loaded). Two models held that seat:
 
 - **Muse-Glimmer-30B** (2026-08-08 → 08-14): vision 30B on a custom **ROCm-FP4** build,
   ~26.5 t/s — FP4-on-ROCm beats Q4_K-on-Vulkan on this bandwidth-bound part. Full
@@ -232,6 +257,7 @@ Nobody has published **>20 t/s of general dense-27B-Q8 decode** on this platform
    quality; MoE buys speed — they are different tools.
 
 ## vLLM on gfx1151 — many-user serving
+_Latest content date: 2026-08-03_
 
 **vLLM runs on Strix Halo.** Serving and generating, verified 2026-08-03 via the
 [lemonade-sdk/vllm-rocm](https://github.com/lemonade-sdk/vllm-rocm) qualified bundle with
@@ -265,6 +291,7 @@ MEM_FRAC=0.5 PORT=8107 bin/vllm-serve-strix.sh /path/to/hf-model
   (`CC`, the real amdsmi, `LD_LIBRARY_PATH`), not a gfx1151 defect.
 
 ## Performance benchmarks
+_Latest content date: 2026-08-14_
 
 ### LLM inference
 
@@ -331,82 +358,10 @@ way.) The 27B-MTP gguf (single file, embedded head) is `unsloth/Qwen3.6-27B-MTP-
 validating**: watch for monologuing / degraded tool-following in real agent loops before trusting it
 over the 35B MoE.
 
-The Q8 / 128k tables below are the earlier (May) baseline, kept for host-config and kernel reference.
-
-#### Gemma 4 26B-A4B-it UD-Q8_K_XL — kernel 7.0 stable
-
-Tested 2026-05-23 against the live llama-server on `:8001`. Host: kernel
-7.0.0-261 vanilla, Mesa 25.3.6, Vulkan RADV, llama-cpp-turboquant build.
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Prompt processing (pp) | **~720 t/s** | 10K-token prompt, 3-run avg (warm runs: 698, 741 t/s) |
-| Token generation (tg) | **~41 t/s** | 64-token generation, 3-run avg, hot |
-| Time to first token | **~269ms** | Short prompt, streamed, 3-run avg (257, 275, 274 ms) |
-| Context size | 131072 | KV cache: q8_0 |
-
-#### Qwen3.6-35B-A3B UD-Q8_K_XL — kernel 7.0 stable
-
-Tested 2026-04-29 against the live llama-server on `:8001`. Host: kernel
-7.0.0-261 vanilla, Mesa 25.3.6, Vulkan RADV, llama-cpp-turboquant build.
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Prompt processing (pp) | **~839 t/s** | 10,223-token prompt |
-| Token generation (tg) | **~44 t/s** | 64-token generation, no reasoning |
-| Time to first token | **~254ms** | 23-token prompt, --no-warmup hot |
-| Context size | 131072 | KV cache: q8_0 |
-
-Numbers in both tables are taken from the server's own `timings` field on real
-OpenAI-compatible chat-completion requests, not synthetic `llama-bench` runs —
-i.e. they reflect actual end-user latency including the chat template + jinja
-rendering.
-
-**Trade quantified.** Moving from Qwen3.6-35B-A3B (3B active) to Gemma 4 26B-A4B
-(4B active) costs ~14% on pp (839 → 720), ~7% on tg (44 → 41), and adds ~15ms
-on TTFT (254 → 269). All within the expected ~33% active-param ratio. Decode
-quality on long-form extraction + structured-output workloads improved enough
-to justify the throughput cost for this box's workload mix; your mileage will
-depend on what you're shipping.
-
-**Note on long-generation throughput.** Streaming a 512-token reply with the
-default `--reasoning-budget 500` and the model's built-in thinking mode produced
-~7 t/s wall-clock on a single request. The slowdown is not a Vulkan/host issue
-— Qwen3.6 silently emits thinking tokens that don't get counted in `predicted_n`,
-so the t/s reported is artificially low. For "real" tg comparisons against
-non-thinking models, set `--reasoning-budget 0` or use a no-reasoning system
-prompt.
-
-#### Legacy baseline — Qwen3.5-122B-A10B UD-Q4_K_XL (kernel 7.0-rc6)
-
-Retained for host-config reference. Tested kernel 7.0-rc6, Mesa 25.3.6.
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| Prompt processing (pp) | 393 t/s | ~2K token prompt |
-| Token generation (tg) | 22 t/s | Stable across runs |
-| Time to first token | ~430ms | Short prompts |
-| Context size | 65536 | KV cache: q8_0 |
-
-#### Kernel comparison
-
-| Metric | Kernel 6.19.9 | Kernel 7.0-rc6 | Change |
-|--------|--------------|----------------|--------|
-| pp | 287-351 t/s | 393 t/s | +12-37% |
-| tg | 22-23 t/s | 22 t/s | No change |
-
-Kernel 7.0 significantly improves prompt processing via RADV/Vulkan improvements, but token generation is memory-bandwidth bound and unchanged.
-
-#### Optimization history
-
-| Setting | Tested values | Winner | Notes |
-|---------|--------------|--------|-------|
-| `--ubatch-size` | 512, 1024, 2048 | **1024** | pp 320 vs 266 vs 320, diminishing returns at 2048 |
-| `--kv-unified` | on, off | **off** | Hurt pp, broke prompt caching, no tg benefit |
-| `-ctk`/`-ctv` | turbo2, q8_0 | **q8_0** | turbo2 not supported on Vulkan (SET_ROWS op missing) |
-| `-fa` | on, off | **on** | Required for good performance on Strix Halo |
+> Earlier (May) baseline benchmark tables, the kernel comparison, and the optimization-history table have moved to [docs/benchmarks-history.md](docs/benchmarks-history.md).
 
 ## Services
+_Latest content date: 2026-08-21_
 
 | Service | Port | Backend | Startup | Description |
 |---------|------|---------|---------|-------------|
@@ -437,6 +392,7 @@ curl http://localhost:8001/health
 ```
 
 ## Kernel boot parameters
+_Latest content date: 2026-08-21_
 
 Required for optimal Strix Halo unified memory performance (current since 2026-08-09):
 
@@ -500,6 +456,7 @@ Set via `grubby` or `/etc/default/grub`.
 | Voice | `kyuz0/amd-strix-halo-voice:latest` | VibeVoice TTS + voice cloning |
 
 ## NPU Setup
+_Latest content date: 2026-07-21_
 
 The XDNA2 NPU requires an out-of-tree driver build — the kernel's built-in amdxdna v0.6.0 has a version mismatch with newer XRT. The COPR `xanderlent/amd-npu-driver` packages (April 2025) are also outdated.
 
@@ -571,6 +528,7 @@ The "Hey Jarvis" assistant's Whisper STT runs on the NPU instead of the CPU, fre
 - **Not movable:** MTP/speculative decoding stays GPU-only (integrated MTP heads = no separable draft; a cross-hardware NPU draft would add per-step latency that eats the speedup).
 
 ## Critical configuration notes
+_Latest content date: 2026-06-08_
 
 ### mmap vs --no-mmap under the GTT regime (updated 2026-06-08)
 
@@ -618,10 +576,11 @@ sudo dnf upgrade --refresh --exclude="kernel*,*rocm*,*hip*,roc*,rccl*,mivisionx*
 | | Vulkan (RADV) | ROCm (kyuz0 toolbox) |
 |---|---|---|
 | LLM (llama.cpp) | **~22 t/s gen, ~393 t/s pp** | ~21 t/s gen, ~268 t/s pp |
-| Image gen (ComfyUI) | N/A | ~198 it/s |
+| Image gen (SDXL, ComfyUI) | N/A | ~1.5 it/s (~15-25 s/image) |
 | Stability | Excellent | Good (needs toolbox) |
 
 ## Models
+_Latest content date: 2026-08-15_
 
 ### LLM (llama-server on port 8001)
 
@@ -659,6 +618,7 @@ Toolbox: `kyuz0/amd-strix-halo-comfyui:latest` (ROCm TheRock nightlies)
 | Wan 2.2 | I2V / T2V | 14B model with 4-step Lightning LoRA |
 
 ## Building llama.cpp (Vulkan)
+_Latest content date: 2026-07-09_
 
 The LLM path now uses a **fresh upstream `~/llama.cpp`** build (verified @ `fb30ba9`,
 2026-07-09) — it exposes the native MTP flag (`--spec-type draft-mtp`) the Qwen3.6
@@ -722,25 +682,10 @@ Build deps: `glslc`, `cmake`, `ninja`, Vulkan headers (mesa 1.4.x). The resultin
 
 ## Build history
 
-| Component | Version | Date | Notes |
-|-----------|---------|------|-------|
-| Qwen3.8-27B VL on :8022 | unsloth UD-Q4_K_XL + mmproj-F16 | 2026-08-14 | Native VL + native MTP in one model; replaced Muse-Glimmer as the second resident |
-| Kernel + boot params | 7.2.0-rc3 vanilla; `amd_iommu=off`, TTM cap 108GiB | 2026-08-09 | IOMMU off (5-12% on this platform); TTM capped below GTT so the GPU can't starve the host |
-| Muse-Glimmer-30B on :8022 | custom ROCm-FP4 build | 2026-08-08 | Second resident (vision), ~26.5 t/s; retired 08-14, unit kept as rollback |
-| llama.cpp | fresh upstream `~/llama.cpp` @ 69bf643 (Vulkan) | 2026-08-08 | Current build for :8001 and :8022 |
-| llama.cpp | fresh upstream `~/llama.cpp` @ fb30ba9 (Vulkan) | 2026-07-10 | Native MTP (`--spec-type draft-mtp`), Qwen3.6 primary, ~75–86 t/s tg |
-| Qwen3.6-35B-A3B MTP model | unsloth UD-Q4_K_XL (~22.85 GB) | 2026-07-10 | MTP layers grafted into GGUF; 256k ctx |
-| llama.cpp | 8793 (Vulkan build from turboquant fork) | 2026-04-03 | 393 t/s pp, 22 t/s tg |
-| llama-server | b8461 (kyuz0 Vulkan RADV) | 2026-03 | 351 t/s pp, 19 t/s tg (replaced) |
-| llama-server | b8299 (official release) | 2026-03-13 | +40% prompt speed over b8119 |
-| llama-server | b8119 (kyuz0 custom) | 2026-02 | Initial build |
-| Kernel | 7.1.0-rc4 (vanilla) | 2026-04-04 | +12-37% pp over 6.19.9 |
-| Kernel | 6.19.9 (Fedora 43) | 2026-03 | Previous stable |
-| XRT | 2.23.0 | 2026-03-22 | Built from amd/xdna-driver submodule |
-| amdxdna driver | 2.23.0 (DKMS) | 2026-03-22 | Out-of-tree, replaces kernel v0.6.0 |
-| NPU firmware | 1.0.0.166 | 2026-03 | Protocol v6.x |
+Moved to [CHANGELOG.md](CHANGELOG.md).
 
 ## Troubleshooting
+_Latest content date: 2026-06-08_
 
 ### System is laggy when model is loaded
 Check the mmap flag on the active unit:
