@@ -8,6 +8,14 @@ Type=simple
 Nice=10
 CPUWeight=40
 Environment=GGML_VK_PREFER_HOST_MEMORY=ON
+# GGML_VK_MMV_NO_SPLIT=1 disables Vulkan batched mat-vec splitting. On Mesa 26
+# (RADV, gfx1151) the split path is a large *decode* regression for single-slot +
+# speculative (MTP) decoding: MTP verifies at small batch sizes that land on the
+# slow split kernels. Measured on Qwen3.8-27B UD-Q4_K_XL + --spec-type draft-mtp
+# (Fedora 44, Mesa 26.1.8): decode 15 -> 23 t/s, prefill unaffected/slightly up,
+# output byte-identical. Harmless on Mesa 25 (that path is not the bottleneck there).
+# See docs/benchmarks-history.md, "Mesa 26 decode regression (Vulkan mat-vec split)".
+Environment=GGML_VK_MMV_NO_SPLIT=1
 ExecStart=%h/llama.cpp/build/bin/llama-server \
   -m %h/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf \
   --mmproj %h/models/qwen3.8-27b/mmproj-F16.gguf \

@@ -75,3 +75,36 @@ Kernel 7.0 significantly improves prompt processing via RADV/Vulkan improvements
 | `-ctk`/`-ctv` | turbo2, q8_0 | **q8_0** | turbo2 not supported on Vulkan (SET_ROWS op missing) |
 | `-fa` | on, off | **on** | Required for good performance on Strix Halo |
 
+## Mesa 26 decode regression (Vulkan mat-vec split) — 2026-09-07
+
+After a Fedora 43 → 44 upgrade (Mesa **25.3.6 → 26.1.8**, RADV, gfx1151), speculative
+(MTP) decoding regressed on **decode only** while prompt processing stayed healthy.
+Measured with a 32-prompt chat-completion harness (thinking off), single-slot,
+Qwen3.8-27B UD-Q4_K_XL + `--spec-type draft-mtp`, ctx 131072:
+
+| Stack | decode t/s | prefill t/s | notes |
+|-------|-----------|-------------|-------|
+| F43, Mesa 25.3.6, current build | **~24** | ~100 | pre-upgrade baseline |
+| F44, Mesa 26.1.8, current build | **15.4** | 106 | decode −34%, prefill fine |
+| F44, Mesa 26.1.8, current build, **`GGML_VK_MMV_NO_SPLIT=1`** | **23.1** | 116 | **fix — both axes recovered** |
+| F44, Mesa 26.1.8, older build (~381 commits behind) | 23.5 | ~38 | recovers decode but halves prefill — inferior to the flag |
+
+Isolation (each step is a one-variable test on the live server):
+
+1. **Kernel ruled out.** Booting kernel 7.2 with Mesa held at 26 gave the *same* 15.4 t/s
+   as the 7.3-rc1 kernel → the amdgpu kernel path is not the regressor. (Don't pin an old
+   kernel for this.)
+2. **Binary × driver interaction.** An older llama.cpp build decoded at ~23 on the same
+   Mesa 26, so the regression tracks an upstream Vulkan change — but that change was
+   *decode-neutral on Mesa 25*; it only regresses once paired with Mesa 26. The trigger is
+   the **batched mat-vec split** path, which MTP verification exercises at small
+   (2–4 column) batch sizes.
+3. **The fix beats pinning.** `GGML_VK_MMV_NO_SPLIT=1` disables that split on the *current*
+   binary and restores decode to ~23 t/s **without** losing the newer build's
+   prompt-processing gains. Output is byte-identical (identical harness pass counts).
+
+Conclusion: on Mesa 26 + gfx1151, set `GGML_VK_MMV_NO_SPLIT=1` for MTP/speculative decode
+serving. It is harmless on Mesa 25. Token generation on this platform remains
+memory-bandwidth bound at the top end; this knob only removes a driver-specific slow path,
+it does not raise the ceiling.
+

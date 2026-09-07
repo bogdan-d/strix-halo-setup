@@ -4,6 +4,8 @@
 
 | Component | Version | Date | Notes |
 |-----------|---------|------|-------|
+| Mesa (Vulkan RADV) | 26.1.8 (Fedora 44) | 2026-09-07 | F43→44 upgrade. ⚠ MTP **decode** regression on gfx1151 (batched mat-vec split) — fix: `GGML_VK_MMV_NO_SPLIT=1` restores decode 15→23 t/s, prefill unaffected. See `docs/benchmarks-history.md` |
+| llama.cpp | upstream master (Vulkan) | 2026-09-06 | Adopted plain upstream over the 69bf643 build for +15-27% prefill (upstream Vulkan `mul_mat_id` pad-K); fork/cherry-pick rejected (re-add decode loss) |
 | Qwen3.8-27B VL on :8022 | unsloth UD-Q4_K_XL + mmproj-F16 | 2026-08-14 | Native VL + native MTP in one model; replaced Muse-Glimmer as the second resident |
 | Kernel + boot params | 7.2.0-rc3 vanilla; `amd_iommu=off`, TTM cap 108GiB | 2026-08-09 | IOMMU off (5-12% on this platform); TTM capped below GTT so the GPU can't starve the host |
 | Muse-Glimmer-30B on :8022 | custom ROCm-FP4 build | 2026-08-08 | Second resident (vision), ~26.5 t/s; retired 08-14, unit kept as rollback |

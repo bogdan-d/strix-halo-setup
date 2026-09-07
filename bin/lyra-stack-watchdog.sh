@@ -14,7 +14,7 @@ LOG="$LOG_DIR/watchdog.log"
 COOLDOWN_DIR="$LOG_DIR/cooldowns"
 mkdir -p "$COOLDOWN_DIR"
 
-CHAT_ID="8430134025"  # Zach's DM
+CHAT_ID="${TG_CHAT_ID:-}"  # operator DM chat id — set via environment, not hardcoded
 COOLDOWN_MIN=30
 
 # Which systemd unit serves the :8001 local LLM — follows the switch file written
@@ -88,7 +88,7 @@ for svc in "${SERVICES[@]}"; do
         recheck=$(systemctl --user is-active "$svc" 2>/dev/null || echo "unknown")
         if [ "$recheck" = "active" ]; then
             log "$svc: restart OK (was $state)"
-            # Don't alert on the recovery — Zach doesn't need to see it.
+            # Don't alert on the recovery — the operator doesn't need to see it.
         else
             alert "$svc" "restart-attempted but still $recheck"
         fi

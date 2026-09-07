@@ -541,6 +541,20 @@ The old advice here ("--mmap is REQUIRED for Vulkan") dated from the 96GB-VGM-ca
 
 `--no-mmap` loads weights into host memory up front (no first-token page-fault stalls); `--mmap` is fine here too since weights stay resident under the GTT regime. If you change either, benchmark on that specific model — don't cargo-cult the flag across units.
 
+### Mesa 26 decode regression on gfx1151 — `GGML_VK_MMV_NO_SPLIT=1` (added 2026-09-07)
+
+Moving to **Mesa 26** (RADV) introduced a **decode-only regression** for speculative (MTP) decoding on gfx1151 that current-upstream llama.cpp binaries hit but older builds did not. On Qwen3.8-27B UD-Q4_K_XL + `--spec-type draft-mtp`, single-slot decode dropped from ~23 to ~15 t/s (−34%) after the Fedora 43→44 / Mesa 25.3.6→26.1.8 move, while prompt processing stayed healthy. It is **decode-specific**: MTP verifies drafts at small batch sizes (2–4 columns), and Mesa 26's RADV handles llama.cpp's *batched mat-vec split* path poorly at exactly those sizes.
+
+**Fix:** set `GGML_VK_MMV_NO_SPLIT=1` on the llama-server unit — it disables the batched mat-vec split and routes those ops through the non-split kernel. Measured effect on the 27B unit: **decode 15 → 23 t/s, prefill unchanged (slightly up), output byte-identical** (same harness pass counts). No downside observed for single-slot + MTP serving.
+
+How it was isolated (the diagnosis, not just the fix):
+
+- Rolling the **kernel** back (7.3-rc1 → 7.2) with Mesa held at 26 changed decode by 0.0 → **not the kernel**.
+- Swapping to an **older llama.cpp build** (≈381 commits behind) recovered decode to ~23 on the same Mesa 26 → the regression rides an upstream Vulkan change, but only bites *in combination with* Mesa 26 (on Mesa 25 both builds decoded the same).
+- `GGML_VK_MMV_NO_SPLIT=1` on the current build recovers decode **without** giving up the newer build's prompt-processing gains — so it beats pinning an old binary.
+
+The knob is harmless on Mesa 25 (that split path isn't the bottleneck there), so it is safe to leave set across driver versions.
+
 ### --no-mmap is REQUIRED for ROCm (opposite of Vulkan!)
 
 ROCm toolbox containers use `--no-mmap` because ROCm's mmap path above 64GB is very slow on gfx1151. The GPU has direct access to system memory in ROCm mode, so `--no-mmap` loads into GPU-accessible memory correctly.
