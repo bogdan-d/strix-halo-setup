@@ -2,10 +2,10 @@
 
 Local LLM/VLM + image/video generation (+ NPU inference, currently disabled by `amd_iommu=off`, see [Kernel boot parameters](#kernel-boot-parameters)) for AMD Strix Halo APU (Ryzen AI MAX+ 395, Radeon 8060S iGPU, XDNA2 NPU) with 128GB unified LPDDR5X (124GiB visible to Linux; the iGPU addresses up to 108GiB of it via GTT — capped on purpose, see boot parameters).
 
-> **Current setup (updated 2026-10-11):** the box runs one of two saved model **fleets**, swapped as a set (stop, load, health-check, smoke-test).
+> **Current setup (updated 2026-10-19):** the box runs one of two saved model **fleets**, swapped as a set (stop, load, health-check, smoke-test).
 >
-> - **Everyday fleet:** **Qwen3.8-27B** (dense, vision) in **ROCmFP4-FAST** on the **ROCmFPX** llama.cpp fork (HIP), native MTP with 4 draft tokens, ctx 131072, reasoning off. **36.8 tok/s decode** single stream (median of 4 prompt types, temp 0) and 284.5 tok/s prefill at an 11.6k prompt. That is 43% faster than the same model on upstream llama.cpp Vulkan on this box. Beside it: llm-jp-4.1-32b-a3b for Japanese, and ComfyUI with Qwen-Image 2.1 (stills) and MiniMax H3 (video). Numbers and launch line: [Qwen3.8-27B FP4 + MTP on ROCmFPX](#qwen38-27b-fp4--mtp-on-rocmfpx-current-everyday-driver).
-> - **Text fleet** (long multi-turn builds): **Qwen3.8-Flash-Next** (~177B MoE, ~6B active per token, 512 experts / 10 used, `qwen4exp` arch) on **halogen-flash-server 0.17.1**, a closed-source gfx1151-only engine from Peonist AI, IQ4_XS GGUF, MTP, vision, ctx 131072. **46.4 tok/s decode** single stream (same harness as the 27B) and ~1,440-1,490 tok/s prefill, 5x the 27B's. Numbers: [Qwen3.8-Flash-Next on halogen 0.17.1](#qwen38-flash-next-on-halogen-0171-current-text-fleet).
+> - **Everyday fleet:** **Qwen3.8-27B** (dense, vision) in **ROCmFP4-FAST** on the **ROCmFPX** llama.cpp fork (HIP), native MTP with 4 draft tokens, ctx 131072, reasoning off. **36.8 tok/s decode** single stream (median of 4 prompt types, temp 0) and 284.5 tok/s prefill at an 11.6k prompt. That is 43% faster than the same model on upstream llama.cpp Vulkan on this box. Beside it: llm-jp-4.1-33b-thinking (dense) for Japanese, and ComfyUI 0.42.1 with Qwen-Image 2.1 (stills) and MiniMax H3 (video). Numbers and launch line: [Qwen3.8-27B FP4 + MTP on ROCmFPX](#qwen38-27b-fp4--mtp-on-rocmfpx-current-everyday-driver).
+> - **Text fleet** (long multi-turn builds): **Qwen3.8-Flash-Next** (~177B MoE, ~6B active per token, 512 experts / 10 used, `qwen4exp` arch) on **halogen-flash-server 0.18.11**, a closed-source gfx1151-only engine from Peonist AI, IQ4_XS GGUF, MTP, vision, ctx 131072. **63.7 tok/s decode** single stream (same harness as the 27B) and ~1,530-1,550 tok/s prefill, 5.4x the 27B's. Numbers: [Qwen3.8-Flash-Next on halogen 0.18.11](#qwen38-flash-next-on-halogen-01811-current-text-fleet).
 > - In both fleets, **:8001** answers with reasoning off and **:8022** serves the same model with reasoning on (send `enable_thinking:false` for plain content).
 >
 > The 35B, Gemma and EngramHalo sections below document earlier fleets and are kept as history.
@@ -44,14 +44,14 @@ Local LLM/VLM + image/video generation (+ NPU inference, currently disabled by `
 │  Everyday fleet                                                  │
 │  ├─ :8001  Qwen3.8-27B ROCmFP4-FAST + MTP n4 (ROCmFPX, HIP)      │
 │  │         vision, reasoning off, 131k ctx, 36.8 tok/s           │
-│  ├─ llm-jp-4.1-32b-a3b (Japanese), steps aside for image jobs    │
-│  └─ ComfyUI (ROCm toolbox)                                       │
+│  ├─ llm-jp-4.1-33b-thinking (Japanese, dense), yields to images  │
+│  └─ ComfyUI 0.42.1 (ROCm toolbox)                                │
 │            Qwen-Image 2.1 (stills), MiniMax H3 (video)           │
 │                                                                  │
 │  Text fleet (long multi-turn builds)                             │
 │  └─ :8001  Qwen3.8-Flash-Next, halogen-flash-server (container)  │
 │            ~177B MoE / ~6B active, IQ4_XS, MTP, vision, 131k ctx │
-│            46.4 tok/s decode, ~1,450 tok/s prefill               │
+│            63.7 tok/s decode, ~1,540 tok/s prefill               │
 │                                                                  │
 │  Both fleets: :8022 = the :8001 model with reasoning on (proxy)  │
 │  On demand: Surya OCR (document layout + OCR)                    │
@@ -83,7 +83,7 @@ _Latest content date: 2026-10-11_
 | Kernel | 7.3.0-rc2 (vanilla) | COPR `@kernel-vanilla/mainline-wo-mergew` |
 | Mesa | 26.2.3 | Vulkan RADV driver |
 | LLM engine, everyday fleet | **ROCmFPX** llama.cpp fork, commit `75e67a92b`, packaged as [julianmb/q38rocm](https://github.com/julianmb/q38rocm) v1.7.0 | HIP on `ROCm0`. Serves Qwen3.8-27B ROCmFP4-FAST with native MTP (`--spec-type draft-mtp`). Runtime libs from TheRock ROCm wheels (`rocm-sdk-core` 7.15 nightly) on `LD_LIBRARY_PATH`. |
-| LLM engine, text fleet | **halogen-flash-server** 0.17.1 ([peonist-ai](https://github.com/peonist-ai/halogen-flash-server)) | Closed-source, gfx1151 only, ships as a container. Serves Qwen3.8-Flash-Next. Replaced the EngramHalo fork (kyuz0 `rocm-10.0-engramhalo` toolbox) in Sep 2026. |
+| LLM engine, text fleet | **halogen-flash-server** 0.18.11 ([peonist-ai](https://github.com/peonist-ai/halogen-flash-server)) | Closed-source, gfx1151 only, ships as a container. Serves Qwen3.8-Flash-Next. Replaced the EngramHalo fork (kyuz0 `rocm-10.0-engramhalo` toolbox) in Sep 2026. |
 | llama.cpp (Vulkan) | upstream | Legacy LLM path, kept for the DeepSeek / Gemma writeups and A/B runs below. |
 | ROCm | 7.2 (kyuz0 toolbox) | For Surya OCR + ComfyUI containers |
 
@@ -137,18 +137,18 @@ podman run -d --name halogen-flash -p 127.0.0.1:8001:8731 \
   -e HALOGEN_CTX=131072 -e HALOGEN_KV_POOL_POSITIONS=131072 -e HALOGEN_MAX_TOK=8192 \
   -e HALOGEN_ENABLE_THINKING=0 \
   -v ~/models/flash-next:/models:ro \
-  ghcr.io/peonist-ai/halogen-flash-server:0.17.1
+  ghcr.io/peonist-ai/halogen-flash-server:0.18.11
 
 curl -s http://127.0.0.1:8001/health    # version, context, vision on/off
 ```
 
-Each start reads the ~94 GB GGUF and repacks it in RAM; `/health` answers once that is done. `HALOGEN_TOKENIZER` is not in the vendor README, but 0.17.1 honours it, and it is needed here because the GGUF sits in a subfolder away from `tokenizer/`; mounting the tokenizer folder at `/tokenizer` is the documented alternative. The tag is pinned to the version measured here; newer releases exist (0.17.5 at the time of writing). On Docker, replace `--group-add keep-groups` with `--group-add video --group-add render`.
+Each start reads the ~94 GB GGUF and repacks it in RAM; `/health` answers once that is done. `HALOGEN_TOKENIZER` is not in the vendor README, but 0.18.11 honours it, and it is needed here because the GGUF sits in a subfolder away from `tokenizer/`; mounting the tokenizer folder at `/tokenizer` is the documented alternative. The tag is pinned to the version measured here, the latest release on 2026-10-19. On Docker, replace `--group-add keep-groups` with `--group-add video --group-add render`.
 
 The other route is halogen's own `.hgn` checkpoint, fetched by the container itself (see its [Quickstart](https://github.com/peonist-ai/halogen-flash-server#quickstart)). Peonist's own comparison (on 0.14) measured it faster on serial decode than unsloth's GGUF and slightly worse on perplexity. The numbers in this README are from the GGUF route.
 
 ### 3. Image and video: ComfyUI
 
-ComfyUI runs in kyuz0's ROCm toolbox ([kyuz0/amd-strix-halo-comfyui-toolboxes](https://github.com/kyuz0/amd-strix-halo-comfyui-toolboxes)) next to the everyday fleet. Setup notes and what fails on gfx1151 are in [docs/comfyui-qwen-image.md](docs/comfyui-qwen-image.md). That doc was written for Qwen-Image 2512; the box now runs Qwen-Image 2.1 for stills and MiniMax H3 for video. The Japanese model (llm-jp-4.1-32b-a3b) runs on upstream llama.cpp Vulkan, see [Building llama.cpp (Vulkan)](#building-llamacpp-vulkan).
+ComfyUI 0.42.1 runs in kyuz0's ROCm toolbox ([kyuz0/amd-strix-halo-comfyui-toolboxes](https://github.com/kyuz0/amd-strix-halo-comfyui-toolboxes)) next to the everyday fleet. Setup notes and what fails on gfx1151 are in [docs/comfyui-qwen-image.md](docs/comfyui-qwen-image.md). That doc was written for Qwen-Image 2512; the box now runs Qwen-Image 2.1 for stills and MiniMax H3 for video. The Japanese model (llm-jp-4.1-33b-thinking, dense, since 2026-10-14; the 32b-a3b MoE before that) runs on llama.cpp Vulkan, built from the llm-jp-4.1 branch with a byte-fallback tokenizer patch, see [Building llama.cpp (Vulkan)](#building-llamacpp-vulkan).
 
 ### Switching fleets
 
@@ -415,37 +415,40 @@ llama-server -m Qwen3.8-27B-ROCmFP4-FAST.gguf --mmproj mmproj-F16.gguf \
 
 `$ROCM_SDK` is the `site-packages` dir of a Python venv with TheRock ROCm wheels installed. `--no-mmap` is required on ROCm (see [Critical configuration notes](#critical-configuration-notes)). Tracked on TokenMark as a "Verified (ran it)" row: <https://tokenmark.app/hardware/strix-halo>
 
-### Qwen3.8-Flash-Next on halogen 0.17.1 (current text fleet)
-_Measured 2026-10-11 on this box with the same harness as the 27B above: one request at a time, 600-token outputs, the server's own `timings`._
+### Qwen3.8-Flash-Next on halogen 0.18.11 (current text fleet)
+_Measured 2026-10-19 on this box with the same harness as the 27B above: one request at a time, 600-token outputs, the server's own `timings`. Median of 3 runs after a fresh server start._
 
-Engine: [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) 0.17.1 (container), MTP draft head plus prompt lookup, ctx 131072, reasoning off.
+Engine: [halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server) 0.18.11 (container), MTP draft head plus prompt lookup, ctx 131072, reasoning off.
 Weights: an IQ4_XS GGUF (UD bit map) loaded through halogen's GGUF path, with halogen's draft head and vision tower.
 
 Decode, tok/s, by prompt type:
 
 | Prompt type | temp 0 | temp 0.7 | MTP drafts accepted (temp 0) |
 |-------------|:-:|:-:|:-:|
-| prose | 35.8 | 35.2 | 262 / 483 |
-| code | 45.9 | 40.3 | 402 / 448 |
-| json | 57.2 | 40.7 | 429 / 467 |
-| reasoning | 46.8 | 39.9 | 383 / 464 |
-| **median** | **46.4** | **40.1** | |
+| prose | 41.2 | 39.3 | 304 / 474 |
+| code | 66.4 | 70.0 | 477 / 562 |
+| json | 68.7 | 75.4 | 464 / 489 |
+| reasoning | 61.1 | 59.5 | 457 / 553 |
+| **median** | **63.7** | **64.8** | |
 
-Prefill: **1,435.9 tok/s** at an 11,626-token prompt (8.1 s to first token), 1,492.4 tok/s at 35,531 tokens (23.8 s).
+Prefill: **1,545.4 tok/s** at a ~12.1k-token prompt (7.9 s to first token), 1,534.9 tok/s at ~37.0k tokens (24.1 s).
 
 Against the everyday 27B, same harness, one fleet loaded at a time:
 
-| Model | Engine | Quant | Decode median, temp 0 | temp 0.7 | Prose, temp 0 | Prefill 11.6k | Prefill 35.5k |
+| Model | Engine | Quant | Decode median, temp 0 | temp 0.7 | Prose, temp 0 | Prefill ~12k | Prefill ~36k |
 |-------|--------|-------|:-:|:-:|:-:|:-:|:-:|
 | Qwen3.8-27B | ROCmFPX, MTP n=4 | ROCmFP4-FAST | 36.8 | 33.3 | 24.2 | 284.5 (41 s) | 223.5 (159 s) |
-| **Qwen3.8-Flash-Next** | **halogen 0.17.1, MTP** | **IQ4_XS** | **46.4** | **40.1** | **35.8** | **1,435.9 (8.1 s)** | **1,492.4 (23.8 s)** |
+| Qwen3.8-Flash-Next (2026-10-11) | halogen 0.17.1, MTP | IQ4_XS | 46.4 | 40.1 | 35.8 | 1,435.9 (8.1 s) | 1,492.4 (23.8 s) |
+| **Qwen3.8-Flash-Next** | **halogen 0.18.11, MTP** | **IQ4_XS** | **63.7** | **64.8** | **41.2** | **1,545.4 (7.9 s)** | **1,534.9 (24.1 s)** |
+
+The prefill prompts differ slightly by run: ~11.6k and ~35.5k tokens for the 27B and the 0.17.1 row, ~12.1k and ~37.0k for the 0.18.11 row.
 
 What this says:
 
-- **Flash-Next decodes 26% faster than the 27B** (46.4 vs 36.8) although it is the far bigger model, because only ~6B of its ~177B parameters are read per token. Prose gains most: 35.8 vs 24.2.
-- **Prefill is 5x faster at 11.6k and 6.7x at 35.5k.** A 35k-token document reaches its first token in 24 s instead of 159 s, which is why long multi-turn builds go to this fleet.
-- **The engine got faster between releases.** On a shorter A/B harness (256-token outputs) on this box, same weights file, halogen 0.13.8 (25 Sep) against 0.17.1 (9 Oct): prose 27.4 to 36.7 tok/s, code 35.7 to 47.7, and four concurrent requests finished in 12.0 s instead of 17.0 s.
-- **Vision answers, but don't trust it for short codes.** Asked to read four rendered codes, it got two exactly and misread `QX-4471` as `0x4471` and `KM-2093` as `KM-003`. The 27B misread `QX-4471` too.
+- **Flash-Next decodes 73% faster than the 27B** (63.7 vs 36.8 tok/s at temp 0, 64.8 vs 33.3 at temp 0.7) although it is the far bigger model, because only ~6B of its ~177B parameters are read per token. Prose: 41.2 vs 24.2.
+- **Prefill is 5.4x faster at ~12k and 6.9x at ~36k.** A 36k-token document reaches its first token in 24 s instead of 159 s, which is why long multi-turn builds go to this fleet.
+- **0.18.11 is a big step over 0.17.1.** Same weights, same harness, same day (2026-10-19), 3 runs each: decode median 46.2 to 63.7 tok/s at temp 0 and 40.1 to 64.8 at temp 0.7, prefill at ~12k 1,456.7 to 1,545.4. The temp 0.7 gain is the larger one: on the code prompt, 0.17.1 proposed 306 MTP drafts and 0.18.11 proposed 571. Earlier, on a shorter A/B harness (256-token outputs), 0.13.8 (25 Sep) against 0.17.1 (9 Oct): prose 27.4 to 36.7 tok/s, code 35.7 to 47.7, and four concurrent requests finished in 12.0 s instead of 17.0 s.
+- **Vision answers, but don't trust it for short codes.** On 0.17.1, asked to read four rendered codes, it got two exactly and misread `QX-4471` as `0x4471` and `KM-2093` as `KM-003`. 0.18.11 still reads `QX-4471` as `0x4471`. The 27B misread `QX-4471` too.
 
 The launch line is in [Quick start](#2-text-fleet-qwen38-flash-next-on-halogen). Tracked on TokenMark as a "Verified (ran it)" row: <https://tokenmark.app/hardware/strix-halo>
 
@@ -776,17 +779,18 @@ sudo dnf upgrade --refresh --exclude="kernel*,*rocm*,*hip*,roc*,rccl*,mivisionx*
 | Stability | Excellent | Good (needs toolbox) |
 
 ## Models
-_Latest content date: 2026-10-14_
+_Latest content date: 2026-10-19_
 
 ### Current fleets (2026-10)
 
 | Fleet | Model | Type | Active params | Quant | Engine | Decode | Use |
 |-------|-------|------|---------------|-------|--------|--------|-----|
 | Everyday | **Qwen3.8-27B** + mmproj-F16 | Dense, vision | 27B | ROCmFP4-FAST | ROCmFPX (HIP), MTP n=4 | **36.8 tok/s** median (24 prose, 45 JSON) | Default driver: chat, coding, vision, writing |
-| Everyday | llm-jp-4.1-32b-a3b-thinking | MoE | 3B | Q4_K_M | llama.cpp llm-jp-4.1 branch + byte-fallback tokenizer patch, Vulkan | **81.0 tok/s** (llama-bench tg256), prefill 1,980 tok/s (pp1024); at 4096 depth 72.6 / 944. ROCmFPX: 73.6 / 1,417, at 4096 depth 64.8 / 1,021 | Japanese |
-| Text | **Qwen3.8-Flash-Next** | MoE, vision | ~6B of ~177B | IQ4_XS GGUF | halogen-flash-server 0.17.1, MTP | **46.4 tok/s** median (36 prose, 57 JSON); prefill ~1,450 tok/s | Long multi-turn builds |
+| Everyday | **llm-jp-4.1-33b-thinking** | Dense | 33B | Q4_K_M | Same llama.cpp build as the row below, Vulkan | **7.7 tok/s** decode, prompt 135 tok/s (measured 2026-10-14) | Japanese, since 2026-10-14 |
+| Everyday until 2026-10-14 | llm-jp-4.1-32b-a3b-thinking | MoE | 3B | Q4_K_M | llama.cpp llm-jp-4.1 branch + byte-fallback tokenizer patch, Vulkan | **81.0 tok/s** (llama-bench tg256), prefill 1,980 tok/s (pp1024); at 4096 depth 72.6 / 944. ROCmFPX: 73.6 / 1,417, at 4096 depth 64.8 / 1,021 | Japanese |
+| Text | **Qwen3.8-Flash-Next** | MoE, vision | ~6B of ~177B | IQ4_XS GGUF | halogen-flash-server 0.18.11, MTP | **63.7 tok/s** median (41 prose, 69 JSON); prefill ~1,540 tok/s | Long multi-turn builds |
 
-Image and video (everyday fleet, ComfyUI): **Qwen-Image 2.1** for stills, **MiniMax H3** for video. A still needs ~41GiB and an H3 clip ~54GiB, so the Japanese model steps aside while a job runs.
+Image and video (everyday fleet, ComfyUI 0.42.1): **Qwen-Image 2.1** for stills, **MiniMax H3** for video. A still needs ~41GiB and an H3 clip ~54GiB, so the Japanese model steps aside while a job runs.
 
 ### LLM, earlier fleets (history: llama-server on port 8001)
 

@@ -4,6 +4,9 @@
 
 | Component | Version | Date | Notes |
 |-----------|---------|------|-------|
+| halogen-flash-server | 0.18.11 | 2026-10-19 | Text-fleet engine. Decode median 63.7 tok/s vs 46.2 on 0.17.1 (64.8 vs 40.1 at temp 0.7), same weights, same harness, same day. See README benchmarks |
+| ComfyUI | 0.42.1 | 2026-10-19 | Everyday-fleet image and video server (Qwen-Image 2.1, MiniMax H3); was 0.37.0 |
+| llm-jp (Japanese, everyday fleet) | llm-jp-4.1-33b-thinking Q4_K_M (dense) | 2026-10-14 | Replaced llm-jp-4.1-32b-a3b-thinking (MoE, 3B active) on the same llama.cpp build: 7.7 tok/s decode vs 81 |
 | Model fleets | everyday (27B + llm-jp + ComfyUI) / text (Flash-Next) | 2026-10-01 | Models swapped as a saved set with health checks and smoke tests, replacing per-model flips (`strix-llm-switch.sh` retired) |
 | halogen-flash-server | 0.17.1 | 2026-10-08 | Text-fleet engine for Qwen3.8-Flash-Next; first cut over from EngramHalo 2026-09-18 (0.11.6) |
 | Mesa (Vulkan RADV) | 26.2.3 (Fedora 44) | 2026-09-29 | Routine update |
