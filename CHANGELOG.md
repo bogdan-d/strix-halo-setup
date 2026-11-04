@@ -4,6 +4,8 @@
 
 | Component | Version | Date | Notes |
 |-----------|---------|------|-------|
+| Qwen3.8-27B engine on :8001 | ROCmFPX `main` `120141f1f` (build 12501), built from source | 2026-11-04 | Replaced the q38rocm v1.7.0 prebuilt (`75e67a92b`). Same day, 3 runs each: prefill 286.7 to 353.1 tok/s at ~12k and 224.2 to 308.6 at ~37k, decode median 37.9 to 38.6. `--no-mmap` is `--load-mode none` on this build. See README benchmarks |
+| halogen-flash-server | 0.18.23 | 2026-11-04 | Text-fleet engine. Level with 0.18.11 on the same day: decode median 68.8 vs 66.3 tok/s (68.8 vs 68.6 at temp 0.7), prefill ~1,600 tok/s on both. See README benchmarks |
 | halogen-flash-server | 0.18.11 | 2026-10-19 | Text-fleet engine. Decode median 63.7 tok/s vs 46.2 on 0.17.1 (64.8 vs 40.1 at temp 0.7), same weights, same harness, same day. See README benchmarks |
 | ComfyUI | 0.42.1 | 2026-10-19 | Everyday-fleet image and video server (Qwen-Image 2.1, MiniMax H3); was 0.37.0 |
 | llm-jp (Japanese, everyday fleet) | llm-jp-4.1-33b-thinking Q4_K_M (dense) | 2026-10-14 | Replaced llm-jp-4.1-32b-a3b-thinking (MoE, 3B active) on the same llama.cpp build: 7.7 tok/s decode vs 81 |
